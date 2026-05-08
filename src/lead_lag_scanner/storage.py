@@ -2,16 +2,32 @@
 
 Each trade is normalised to::
 
-    timestamp_ms (int64)   exchange (str)   symbol (str)   price (float64)
-    amount (float64)       side (str)       trade_id (str)
+    timestamp_ms       (int64)   — exchange matching-engine timestamp (ms)
+    exchange           (str)
+    symbol             (str)
+    price              (float64)
+    amount             (float64)
+    side               (str)
+    trade_id           (str)
+    local_recv_ts_ns   (int64)   — collector wall-clock when the trade was
+                                   received, in nanoseconds since epoch
+                                   (0 if unknown, e.g. from legacy shards)
+
+The ``local_recv_ts_ns`` column lets the analyzer (a) calibrate per-exchange
+clock skew using ``median(local_recv − exchange_ts)``, (b) reason about
+WebSocket / REST transport latency, and (c) drop trades whose
+``|local − exchange_ts|`` is implausibly large.
 
 Trades are buffered in memory and flushed to parquet files partitioned by
 ``exchange`` and ``date``::
 
     <data_dir>/trades/<exchange>/<YYYY-MM-DD>.parquet
 
-A DuckDB database is created on demand (`build_duckdb_view`) and exposes a
-single view ``trades`` that unions every parquet shard.
+A DuckDB database is created on demand (``build_duckdb_view``) and exposes a
+single view ``trades`` that unions every parquet shard. Old shards written
+before ``local_recv_ts_ns`` was added are loaded with that column filled to
+0; the analyzer treats 0 as "unknown" and silently skips that trade for
+clock-skew calibration purposes.
 """
 
 from __future__ import annotations
@@ -34,8 +50,11 @@ TRADE_SCHEMA = pa.schema(
         pa.field("amount", pa.float64()),
         pa.field("side", pa.string()),
         pa.field("trade_id", pa.string()),
+        pa.field("local_recv_ts_ns", pa.int64()),
     ]
 )
+
+TRADE_COLUMNS: tuple[str, ...] = tuple(f.name for f in TRADE_SCHEMA)
 
 
 @dataclass(slots=True)
@@ -49,6 +68,7 @@ class Trade:
     amount: float
     side: str
     trade_id: str
+    local_recv_ts_ns: int = 0
 
 
 @dataclass(slots=True)
@@ -82,13 +102,38 @@ class TradeWriter:
             shard_path = shard_dir / f"{day}.parquet"
             table = _trades_to_table(trades)
             if shard_path.exists():
-                existing = pq.read_table(shard_path)
+                existing = _read_shard_promoting(shard_path)
                 table = pa.concat_tables([existing, table])
             pq.write_table(table, shard_path, compression="zstd")
         self._buffer.clear()
 
     def close(self) -> None:
         self.flush()
+
+
+def _read_shard_promoting(path: Path) -> pa.Table:
+    """Read an existing shard and promote it to :data:`TRADE_SCHEMA`.
+
+    Older shards (pre-``local_recv_ts_ns``) lack one or more of the columns
+    in the current schema; we backfill missing columns with zero / empty
+    string before concatenating against newly buffered rows.
+    """
+
+    existing = pq.read_table(path)
+    if existing.schema.equals(TRADE_SCHEMA):
+        return existing
+    n = existing.num_rows
+    columns: dict[str, pa.Array] = {name: existing.column(name) for name in existing.column_names}
+    for f in TRADE_SCHEMA:
+        if f.name in columns:
+            continue
+        if pa.types.is_integer(f.type):
+            columns[f.name] = pa.array([0] * n, type=f.type)
+        elif pa.types.is_floating(f.type):
+            columns[f.name] = pa.array([0.0] * n, type=f.type)
+        else:
+            columns[f.name] = pa.array([""] * n, type=f.type)
+    return pa.table(columns, schema=TRADE_SCHEMA)
 
 
 def _trades_to_table(trades: list[Trade]) -> pa.Table:
@@ -101,6 +146,7 @@ def _trades_to_table(trades: list[Trade]) -> pa.Table:
             "amount": [t.amount for t in trades],
             "side": [t.side for t in trades],
             "trade_id": [t.trade_id for t in trades],
+            "local_recv_ts_ns": [t.local_recv_ts_ns for t in trades],
         },
         schema=TRADE_SCHEMA,
     )
@@ -133,14 +179,16 @@ def load_trades(
     """Load trades from parquet into a pandas DataFrame.
 
     Returns an empty DataFrame with the correct columns if nothing has been
-    collected yet.
+    collected yet. Old shards lacking the ``local_recv_ts_ns`` column are
+    loaded with zeros via DuckDB's ``union_by_name=true``; missing columns
+    are backfilled to 0 / "" so the returned frame always has the canonical
+    schema.
     """
 
     glob = parquet_glob(data_dir)
-    cols = ["timestamp_ms", "exchange", "symbol", "price", "amount", "side", "trade_id"]
     try:
         with duckdb.connect() as con:
-            query = f"SELECT * FROM read_parquet('{glob}', hive_partitioning=0)"
+            query = f"SELECT * FROM read_parquet('{glob}', hive_partitioning=0, union_by_name=true)"
             params: list[str] = []
             filters: list[str] = []
             if exchange is not None:
@@ -153,8 +201,23 @@ def load_trades(
                 query += " WHERE " + " AND ".join(filters)
             df = con.execute(query, params).df()
     except duckdb.IOException:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=list(TRADE_COLUMNS))
 
     if df.empty:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=list(TRADE_COLUMNS))
+
+    # Backfill missing canonical columns (older shards / partial schemas).
+    for name in TRADE_COLUMNS:
+        if name in df.columns:
+            continue
+        if name in {"local_recv_ts_ns", "timestamp_ms"}:
+            df[name] = 0
+        elif name in ("price", "amount"):
+            df[name] = 0.0
+        else:
+            df[name] = ""
+    # ``local_recv_ts_ns`` may be NULL on union'd reads when one shard had
+    # the column and another didn't; coerce NULLs to 0 (= unknown).
+    if bool(df["local_recv_ts_ns"].isna().any()):
+        df["local_recv_ts_ns"] = df["local_recv_ts_ns"].fillna(0).astype("int64")
     return df

@@ -32,12 +32,29 @@ class CollectionStats:
     trades_received: int = 0
     trades_written: int = 0
     errors: int = 0
+    trades_dropped_drift: int = 0  # trades whose |local-exchange| > drift cap
 
 
-def _normalise_trade(exchange_id: str, symbol: str, raw: dict[str, Any]) -> Trade | None:
+# Trades whose exchange-reported timestamp differs from our local receive
+# clock by more than this many milliseconds are dropped at ingestion. Such
+# trades are almost always API quirks (an exchange returning microseconds in
+# a field documented as milliseconds, or a stale `since=` reset returning
+# historical data) and they would otherwise poison clock-skew calibration.
+# This is intentionally generous (1 hour) so that NTP-loose exchanges and
+# WebSocket reconnect bursts are still kept.
+_MAX_INGEST_DRIFT_MS: int = 3_600_000
+
+
+def _normalise_trade(
+    exchange_id: str,
+    symbol: str,
+    raw: dict[str, Any],
+    local_recv_ts_ns: int,
+) -> Trade | None:
     """Convert a ccxt trade dict into our internal :class:`Trade` shape.
 
-    Returns ``None`` when the trade is missing fields we cannot recover from.
+    Returns ``None`` when the trade is missing fields we cannot recover from
+    or has a timestamp that drifts implausibly far from ``local_recv_ts_ns``.
     """
 
     ts = raw.get("timestamp")
@@ -48,14 +65,19 @@ def _normalise_trade(exchange_id: str, symbol: str, raw: dict[str, Any]) -> Trad
     side = raw.get("side") or "unknown"
     trade_id = raw.get("id") or ""
     try:
+        ts_ms = int(ts)
+        local_recv_ms = local_recv_ts_ns // 1_000_000
+        if abs(local_recv_ms - ts_ms) > _MAX_INGEST_DRIFT_MS:
+            return None
         return Trade(
-            timestamp_ms=int(ts),
+            timestamp_ms=ts_ms,
             exchange=exchange_id,
             symbol=symbol,
             price=float(price),
             amount=float(amount),
             side=str(side),
             trade_id=str(trade_id),
+            local_recv_ts_ns=local_recv_ts_ns,
         )
     except (TypeError, ValueError):
         return None
@@ -69,6 +91,7 @@ async def _watch_trades_loop(
     stop_event: asyncio.Event,
 ) -> None:
     client = handle.client
+    seen: set[str] = set()
     while not stop_event.is_set():
         try:
             trades: list[dict[str, Any]] = await client.watch_trades(symbol)
@@ -84,13 +107,26 @@ async def _watch_trades_loop(
             )
             await asyncio.sleep(1.0)
             continue
+        # ccxt.pro delivers trades in batches; capture the local clock once
+        # per batch so that trades sharing a single network frame share their
+        # ``local_recv_ts_ns`` and clock-skew calibration is not biased by
+        # how the analyzer iterates the batch.
+        local_recv_ns = time.time_ns()
         for raw in trades:
-            tr = _normalise_trade(handle.exchange_id, symbol, raw)
+            tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
+                if raw.get("timestamp") is not None:
+                    stats.trades_dropped_drift += 1
                 continue
+            key = f"{tr.timestamp_ms}-{tr.trade_id}-{tr.price}-{tr.amount}"
+            if key in seen:
+                continue
+            seen.add(key)
             stats.trades_received += 1
             writer.append(tr)
             stats.trades_written += 1
+        if len(seen) > 100_000:
+            seen = set(list(seen)[-50_000:])
 
 
 async def _fetch_trades_loop(
@@ -121,9 +157,12 @@ async def _fetch_trades_loop(
             )
             await asyncio.sleep(poll_interval * 2)
             continue
+        local_recv_ns = time.time_ns()
         for raw in trades:
-            tr = _normalise_trade(handle.exchange_id, symbol, raw)
+            tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
+                if raw.get("timestamp") is not None:
+                    stats.trades_dropped_drift += 1
                 continue
             key = f"{tr.timestamp_ms}-{tr.trade_id}-{tr.price}-{tr.amount}"
             if key in seen:

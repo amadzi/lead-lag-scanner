@@ -176,3 +176,65 @@ async def has_market(handle: ExchangeHandle, symbol: str) -> bool:
             return False
     markets = getattr(client, "markets", None) or {}
     return symbol in markets
+
+
+async def _list_quoted_spot_symbols(exchange_id: str, quote: str) -> list[str]:
+    """Return all spot symbols of the form ``BASE/{quote}`` for ``exchange_id``.
+
+    Returns an empty list (and swallows the error) on any failure — this
+    function is used for bulk discovery and we never want a single bad
+    exchange to break the probe.
+    """
+
+    try:
+        handle = make_handle(exchange_id, prefer_websocket=False)
+    except Exception:  # discovery is best-effort; never propagate failures
+        return []
+
+    client = handle.client
+    syms: list[str] = []
+    try:
+        try:
+            markets = await client.load_markets()
+        except Exception:
+            return []
+        for symbol, market in (markets or {}).items():
+            if not isinstance(market, dict):
+                continue
+            if market.get("quote") != quote:
+                continue
+            # Filter out derivatives — we only care about spot lead-lag.
+            if market.get("type") not in (None, "spot"):
+                continue
+            if market.get("contract") or market.get("swap") or market.get("future"):
+                continue
+            if market.get("active") is False:
+                continue
+            syms.append(symbol)
+    finally:
+        await close_handle(handle)
+    return syms
+
+
+async def probe_usdt_symbols(
+    exchange_ids: list[str] | tuple[str, ...],
+    *,
+    quote: str = "USDT",
+) -> dict[str, list[str]]:
+    """Discover ``BASE/{quote}`` spot symbols across many exchanges.
+
+    Returns a mapping ``symbol -> list_of_exchange_ids_that_list_it``,
+    ordered by the order ``exchange_ids`` are probed (which is the input
+    order). Exchanges that fail to load markets contribute nothing.
+
+    Probing is sequential rather than parallel so we do not stampede each
+    exchange's REST endpoint and so a hang on one exchange does not stall
+    the whole probe (each exchange's failure is local).
+    """
+
+    coverage: dict[str, list[str]] = {}
+    for exchange_id in exchange_ids:
+        symbols = await _list_quoted_spot_symbols(exchange_id, quote)
+        for sym in symbols:
+            coverage.setdefault(sym, []).append(exchange_id)
+    return coverage

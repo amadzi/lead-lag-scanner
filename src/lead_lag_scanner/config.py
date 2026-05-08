@@ -45,10 +45,42 @@ class BootstrapConfig:
 
 @dataclass(frozen=True, slots=True)
 class AnalyzerConfig:
+    """Knobs that control the lead-lag analyzer.
+
+    The default behaviour applies four data-quality fixes that matter when
+    scanning many exchanges at once:
+
+    * **Clock-skew calibration** (``clock_skew_calibration``): each exchange's
+      timestamps are re-centered using the median of
+      ``local_recv_ts_ns − exchange_ts_ms`` per exchange, so that systematic
+      offsets between exchange matching-engine clocks (often ±100–500 ms,
+      sometimes seconds) do not show up as spurious lag.
+    * **Sanity filter** (``max_clock_drift_seconds``): trades whose
+      ``|local_recv − exchange_ts|`` exceeds this many seconds are dropped as
+      probable API quirks (e.g. an exchange returning microseconds in a field
+      documented as milliseconds).
+    * **Active-bar masking** (``active_mask``): the cross-correlation only
+      uses bars where *both* exchanges actually saw a trade in the bar. This
+      prevents the forward-fill of stale prices on low-tick-frequency
+      exchanges from creating phantom lag.
+    * **Low-tick filter** (``min_active_rate``): an (exchange, symbol) is
+      dropped from the analysis if the fraction of bars containing a real
+      trade is below this threshold. The ratio is computed against the bar
+      count of the *busier* side so a slow venue cannot anchor a fast one.
+
+    Setting any of the toggles to ``False`` (or the threshold to 0) reverts
+    to the legacy un-masked / un-calibrated behaviour, which is useful for
+    sanity-checking the impact of each fix.
+    """
+
     resample_seconds: float = 1.0
     lag_grid: LagGrid = field(default_factory=LagGrid)
     min_obs: int = 600
     bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
+    clock_skew_calibration: bool = True
+    max_clock_drift_seconds: float = 3600.0
+    active_mask: bool = True
+    min_active_rate: float = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +159,10 @@ def _load_analyzer(d: dict[str, Any]) -> AnalyzerConfig:
             block_size=int(bs.get("block_size", 30)),
             n_iter=int(bs.get("n_iter", 200)),
         ),
+        clock_skew_calibration=bool(d.get("clock_skew_calibration", True)),
+        max_clock_drift_seconds=float(d.get("max_clock_drift_seconds", 3600.0)),
+        active_mask=bool(d.get("active_mask", True)),
+        min_active_rate=float(d.get("min_active_rate", 0.05)),
     )
 
 

@@ -1,18 +1,22 @@
 """Report generation: Markdown summary + machine-readable JSON config.
 
 The Markdown report is sorted by absolute correlation (descending) and
-includes a naive bps-edge proxy. The JSON file contains the same data in a
-forward-compatible schema that downstream execution bots can consume.
+includes a naive bps-edge proxy and an active-rate column. A second table
+surfaces per-exchange data-quality diagnostics (median transport latency
+and the clock-skew offset the analyzer applied). The JSON file contains
+the same data in a forward-compatible schema that downstream execution
+bots can consume.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .analyzer import LeadLagResult
+from .analyzer import ExchangeDiagnostics, LeadLagResult
 from .config import ReportConfig
 
 MARKDOWN_HEADER = """\
@@ -20,8 +24,23 @@ MARKDOWN_HEADER = """\
 
 Generated: {generated_at}
 
-| Symbol | Leader | Follower | Lag (s) | Lag CI (s) | |Corr| | Corr@0 | Edge (bps) | n |
-|--------|--------|----------|---------|------------|-------|--------|------------|---|
+| Symbol | Leader | Follower | Lag (s) | Lag CI (s) | |Corr| | Corr@0 | Edge (bps) | Active A/B | n |
+|--------|--------|----------|---------|------------|-------|--------|------------|------------|---|
+"""
+
+DIAGNOSTICS_HEADER = """\
+
+## Per-exchange data quality
+
+`transport_latency_p50` is the median of `local_recv − exchange_ts` and
+captures both network RTT and the exchange's clock skew vs our local
+clock. The analyzer subtracts the *cross-exchange median* of these
+values from each timestamp, so `clock_offset_applied` is the residual
+skew that was applied to align this exchange to the consensus timeline
+(positive = pushed forward in time, negative = pulled earlier).
+
+| Exchange | Trades | Transport latency p50 (ms) | Clock offset applied (ms) |
+|----------|-------:|---------------------------:|--------------------------:|
 """
 
 
@@ -43,16 +62,11 @@ def _format_row(result: LeadLagResult, taker_bps: float) -> str:
         leader_disp = follower_disp = "—"
     else:
         leader_disp, follower_disp = result.leader, result.follower
-    ci_low = (
-        "—"
-        if result.lag_ci_low_seconds != result.lag_ci_low_seconds
-        else f"{result.lag_ci_low_seconds:+.2f}"
-    )
+    ci_low = "—" if math.isnan(result.lag_ci_low_seconds) else f"{result.lag_ci_low_seconds:+.2f}"
     ci_high = (
-        "—"
-        if result.lag_ci_high_seconds != result.lag_ci_high_seconds
-        else f"{result.lag_ci_high_seconds:+.2f}"
+        "—" if math.isnan(result.lag_ci_high_seconds) else f"{result.lag_ci_high_seconds:+.2f}"
     )
+    active = f"{result.active_rate_a * 100:.0f}%/{result.active_rate_b * 100:.0f}%"
     return (
         f"| {result.symbol} "
         f"| {leader_disp} "
@@ -62,15 +76,31 @@ def _format_row(result: LeadLagResult, taker_bps: float) -> str:
         f"| {abs(result.best_correlation):.3f} "
         f"| {result.correlation_at_zero:.3f} "
         f"| {edge:+.1f} "
+        f"| {active} "
         f"| {result.n_obs} |"
+    )
+
+
+def _format_diagnostic_row(d: ExchangeDiagnostics) -> str:
+    return (
+        f"| {d.exchange} "
+        f"| {d.n_trades} "
+        f"| {d.transport_latency_p50_ms:+.1f} "
+        f"| {d.clock_offset_ms:+.1f} |"
     )
 
 
 def write_reports(
     results: list[LeadLagResult],
     config: ReportConfig,
+    *,
+    diagnostics: list[ExchangeDiagnostics] | None = None,
 ) -> tuple[Path, Path]:
-    """Write Markdown + JSON reports and return their paths."""
+    """Write Markdown + JSON reports and return their paths.
+
+    ``diagnostics`` is optional; when present it is emitted as a second
+    Markdown table and as a ``"diagnostics"`` array in the JSON payload.
+    """
 
     config.markdown_path.parent.mkdir(parents=True, exist_ok=True)
     config.json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,13 +121,24 @@ def write_reports(
             md_parts.append(_format_row(r, config.taker_bps))
         md_parts.append("")
         md_parts.append(
-            "> Edge (bps) is a naive proxy: `|corr| × σ(follower) × 1e4 − 2 × taker_bps`.\n"
-            "> Treat any positive value as *worth backtesting properly*, not as guaranteed PnL.\n"
+            "> Edge (bps) is a naive proxy: "
+            "`|corr| × σ(follower) × 1e4 − 2 × taker_bps`.\n"
+            "> `Active A/B` is the fraction of overlapping bars in which each "
+            "side had a *real* trade (not forward-filled); pairs are dropped "
+            "when either side is below `analyzer.min_active_rate`.\n"
+            "> Treat any positive Edge as *worth backtesting properly*, not as "
+            "guaranteed PnL.\n"
         )
+
+    if diagnostics:
+        md_parts.append(DIAGNOSTICS_HEADER)
+        for d in diagnostics:
+            md_parts.append(_format_diagnostic_row(d))
+        md_parts.append("")
 
     config.markdown_path.write_text("\n".join(md_parts), encoding="utf-8")
 
-    json_payload = {
+    json_payload: dict[str, object] = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "taker_bps_assumption": config.taker_bps,
         "min_abs_correlation": config.min_abs_correlation,
@@ -109,6 +150,8 @@ def write_reports(
             for r in filtered
         ],
     }
+    if diagnostics:
+        json_payload["diagnostics"] = [asdict(d) for d in diagnostics]
     config.json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
 
     return config.markdown_path, config.json_path

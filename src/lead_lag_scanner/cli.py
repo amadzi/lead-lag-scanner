@@ -2,11 +2,13 @@
 
 Usage::
 
-    lead-lag-scanner collect   [--config PATH] [--duration SECONDS]
-    lead-lag-scanner analyze   [--config PATH]
-    lead-lag-scanner report    [--config PATH]
-    lead-lag-scanner dashboard [--config PATH] [--top N] [--sort KEY] [--strict]
-    lead-lag-scanner run       [--config PATH] [--duration SECONDS]
+    lead-lag-scanner collect       [--config PATH] [--duration SECONDS]
+    lead-lag-scanner analyze       [--config PATH]
+    lead-lag-scanner report        [--config PATH]
+    lead-lag-scanner dashboard     [--config PATH] [--top N] [--sort KEY] [--strict]
+    lead-lag-scanner run           [--config PATH] [--duration SECONDS]
+    lead-lag-scanner probe-symbols [--config PATH] [--min-exchanges N] [--top N]
+                                   [--quote QUOTE] [--out PATH]
 """
 
 from __future__ import annotations
@@ -21,10 +23,11 @@ import click
 import structlog
 
 from . import __version__
-from .analyzer import analyze_all
+from .analyzer import analyze_all_with_diagnostics
 from .collector import collect
 from .config import Config, load_config
 from .dashboard import run_dashboard
+from .exchanges import probe_usdt_symbols
 from .reporter import write_reports
 from .storage import build_duckdb_view, load_trades
 
@@ -111,10 +114,16 @@ def analyze_cmd(config_path: Path | None) -> None:
         click.echo("no trades found in data/ — run `collect` first", err=True)
         sys.exit(1)
     click.echo(f"loaded {len(trades)} trades; running analyzer", err=True)
-    results = analyze_all(trades, config.analyzer)
-    md_path, json_path = write_reports(results, config.report)
+    output = analyze_all_with_diagnostics(trades, config.analyzer)
+    md_path, json_path = write_reports(
+        output.results, config.report, diagnostics=output.diagnostics
+    )
     click.echo(f"wrote {md_path} and {json_path}", err=True)
-    click.echo(f"reported {len(results)} pairs above min_obs threshold", err=True)
+    click.echo(
+        f"reported {len(output.results)} pairs above min_obs threshold "
+        f"(diagnostics for {len(output.diagnostics)} exchanges)",
+        err=True,
+    )
 
 
 @cli.command("report", help="Re-emit Markdown + JSON reports without re-analyzing.")
@@ -132,8 +141,10 @@ def report_cmd(config_path: Path | None) -> None:
 
     config = load_config(config_path)
     trades = load_trades(config.storage.data_dir)
-    results = analyze_all(trades, config.analyzer)
-    md_path, json_path = write_reports(results, config.report)
+    output = analyze_all_with_diagnostics(trades, config.analyzer)
+    md_path, json_path = write_reports(
+        output.results, config.report, diagnostics=output.diagnostics
+    )
     click.echo(f"wrote {md_path} and {json_path}", err=True)
 
 
@@ -232,9 +243,92 @@ def run_cmd(config_path: Path | None, duration: float | None) -> None:
     config = _override_duration(load_config(config_path), duration)
     asyncio.run(collect(config))
     trades = load_trades(config.storage.data_dir)
-    results = analyze_all(trades, config.analyzer)
-    write_reports(results, config.report)
+    output = analyze_all_with_diagnostics(trades, config.analyzer)
+    write_reports(output.results, config.report, diagnostics=output.diagnostics)
     click.echo("run complete", err=True)
+
+
+@cli.command(
+    "probe-symbols",
+    help=(
+        "Probe every exchange in the config (or all known ccxt exchanges) for "
+        "USDT-quoted symbols and emit a YAML snippet of those listed on at "
+        "least N exchanges, sorted by coverage."
+    ),
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+)
+@click.option(
+    "--min-exchanges",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Only emit symbols listed on at least this many exchanges.",
+)
+@click.option(
+    "--top",
+    "top_n",
+    type=int,
+    default=None,
+    help="Cap the output to the top-N most-listed symbols.",
+)
+@click.option(
+    "--quote",
+    type=str,
+    default="USDT",
+    show_default=True,
+    help="Quote currency to filter on.",
+)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the YAML snippet to this file instead of stdout.",
+)
+def probe_symbols_cmd(
+    config_path: Path | None,
+    min_exchanges: int,
+    top_n: int | None,
+    quote: str,
+    out_path: Path | None,
+) -> None:
+    config = load_config(config_path)
+    click.echo(
+        f"probing {len(config.exchanges)} exchanges for {quote}-quoted spot symbols…",
+        err=True,
+    )
+    coverage = asyncio.run(probe_usdt_symbols(list(config.exchanges), quote=quote))
+    eligible = [
+        (sym, exchanges) for sym, exchanges in coverage.items() if len(exchanges) >= min_exchanges
+    ]
+    eligible.sort(key=lambda kv: (-len(kv[1]), kv[0]))
+    if top_n is not None:
+        eligible = eligible[:top_n]
+    click.echo(
+        f"  {len(eligible)} symbol(s) listed on ≥{min_exchanges} exchanges "
+        f"(of {len(coverage)} total)",
+        err=True,
+    )
+
+    lines: list[str] = [
+        f"# probe-symbols: {len(eligible)} {quote}-quoted symbols on "
+        f">={min_exchanges} of {len(config.exchanges)} configured exchanges",
+        "symbols:",
+    ]
+    for sym, exchanges in eligible:
+        lines.append(f"  - {sym}  # {len(exchanges)} exchanges: {', '.join(sorted(exchanges))}")
+    snippet = "\n".join(lines) + "\n"
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(snippet, encoding="utf-8")
+        click.echo(f"wrote {out_path}", err=True)
+    else:
+        click.echo(snippet)
 
 
 if __name__ == "__main__":  # pragma: no cover

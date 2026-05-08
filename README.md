@@ -42,7 +42,8 @@ uv sync
 #    Without this you fall back to REST polling, which is fine but slower.
 uv sync --extra ws
 
-# 6. Collect 1 hour of public trades from the default 51 exchanges × ~28 symbols
+# 6. Collect 1 hour of public trades from the default 51 exchanges × 200 symbols
+#    (BTC/ETH/SOL plus every USDT pair listed on >=5 of the 51 exchanges).
 uv run lead-lag-scanner collect
 
 # 7. Analyze + emit reports
@@ -95,13 +96,16 @@ want to override:
 
 - **Duration** — defaults to 3600 s (1 hour). For a quick test, override at the
   CLI: `uv run lead-lag-scanner collect --duration 600` (10 min).
-- **Symbols** — default set covers BTC / ETH / SOL plus high-volatility
-  memecoins (DOGE, SHIB, PEPE, WIF, BONK, FLOKI, TRUMP, PUMP, VIRTUAL, PNUT,
-  MOODENG, FARTCOIN, POPCAT, BRETT, BOME, TURBO, MEW, GOAT) and volatile
-  alt-L1 / themed picks (SUI, APT, SEI, TIA, INJ, ORDI, WLD, AIXBT). Edit
-  `config/default.yaml` or pass your own `--config` YAML to add or trim. The
-  collector silently skips any (exchange, symbol) pair that is not listed,
-  so adding a symbol that exists on only some venues is safe.
+- **Symbols** — default set is **200 USDT-quoted pairs**, every symbol listed
+  on at least 5 of the 51 configured exchanges, sorted by exchange coverage.
+  Top of the list is BTC / ETH / SOL / XRP / ADA / DOGE / SHIB / PEPE; the
+  long tail covers TRUMP, PUMP, WIF, BONK, FLOKI, POPCAT, BRETT, MOODENG,
+  FARTCOIN, AIXBT, VIRTUAL, GOAT, MEW, TURBO, BOME, PNUT, DOGS, PENGU and
+  many more memecoins / alt-L1s. Regenerate the list at any time with
+  `uv run lead-lag-scanner probe-symbols --min-exchanges 5 --top 200 --out
+  config/symbols.yaml` and merge into your config. The collector silently
+  skips any (exchange, symbol) pair that is not listed, so adding a symbol
+  that exists on only some venues is safe.
 - **Exchanges** — 51 curated by default; some may be geo-blocked from your
   ISP (in which case the collector logs a warning and skips them). To run on
   a smaller set, copy `config/default.yaml` and trim the list.
@@ -160,6 +164,40 @@ edge_bps ≈ |corr| × σ(returns_follower) × scaling − 2 × taker_fee_bps
 where `scaling` is empirical and conservatively set so that only signals with
 edge meaningfully above the round-trip fee are highlighted.
 
+### Data-quality fixes
+
+Multi-exchange tick collection is messy: clocks drift, REST-batched trades
+arrive in clumps, low-tick markets force-fill bars and produce phantom
+leadership. The analyzer applies four corrections (each individually
+toggleable in `config/default.yaml`):
+
+| Knob                                | What it does                                                                                                                                                                                                                                                                                  |
+|-------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `analyzer.clock_skew_calibration`   | For every exchange, compute the median `local_recv − exchange_ts` offset and re-center it onto the cross-exchange consensus median. Removes systematic clock skew (often ±100–500 ms, sometimes seconds) from the lag estimate. The collector now records `local_recv_ts_ns` on every trade for this. |
+| `analyzer.max_clock_drift_seconds`  | Trades whose `\|local_recv − exchange_ts\| > 1 h` are rejected at ingest and excluded from skew calibration. Catches API quirks (microseconds in a millisecond field, garbage timestamps).                                                                                                       |
+| `analyzer.active_mask`              | Restrict the cross-correlation to bars where **both** sides actually saw a trade — not forward-filled. The single most important fix against false lead-lag from low-tick exchanges.                                                                                                            |
+| `analyzer.min_active_rate`          | (exchange, symbol) pairs whose active-bar ratio is below this threshold are dropped before correlation. Default 5% — kills illiquid pairs that would otherwise dominate the report.                                                                                                            |
+| Collector trade dedup               | Trades are de-duplicated by `(exchange, symbol, trade_id)` (or `(exchange, symbol, ts, price, amount)` when no id is exposed). Stops batched WebSocket / REST replays from inflating sample size.                                                                                              |
+
+All four fixes are on by default. The report includes a per-exchange
+diagnostics table with `transport_latency_p50_ms` (median local-recv minus
+exchange-ts) and `clock_offset_ms` (the calibration applied) so you can see
+which exchanges are slow / drifting.
+
+### Refreshing the symbol list
+
+```bash
+# All USDT-quoted pairs on at least 5 of the configured exchanges,
+# top 200 by exchange coverage, written as a drop-in YAML snippet.
+uv run lead-lag-scanner probe-symbols --min-exchanges 5 --top 200 \
+    --out config/symbols.yaml
+```
+
+The output is sorted by descending exchange count and includes a comment
+on each line listing every exchange that lists the symbol. Paste the
+`symbols:` block into `config/default.yaml` (or load it directly with
+`--config`) to refresh against the current state of every venue.
+
 ## Caveats
 
 - Public trade feeds are *not* tick-true order-book updates; lead/lag estimates
@@ -194,11 +232,12 @@ src/lead_lag_scanner/
     reporter.py      # Markdown + JSON output
     dashboard.py     # live terminal dashboard (rich)
 tests/
-    test_analyzer.py # property + golden-data tests on synthetic series
+    test_analyzer.py       # property + golden-data tests on synthetic series
     test_storage.py
     test_config.py
     test_reporter.py
     test_dashboard.py
+    test_probe_symbols.py  # symbol-discovery + probe-symbols CLI
 ```
 
 ## License
