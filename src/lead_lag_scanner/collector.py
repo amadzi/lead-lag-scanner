@@ -103,13 +103,12 @@ async def _fetch_trades_loop(
 ) -> None:
     client = handle.client
     seen: set[str] = set()
-    last_ts: int | None = None
+    # Seed `since` to ~5 seconds ago so we don't pull historical archives from
+    # exchanges (e.g. Kraken) that default to the first-ever trade.
+    last_ts: int = int(time.time() * 1000) - 5_000
     while not stop_event.is_set():
         try:
-            params: dict[str, Any] = {}
-            if last_ts is not None:
-                params["since"] = last_ts
-            trades: list[dict[str, Any]] = await client.fetch_trades(symbol, params=params)
+            trades: list[dict[str, Any]] = await client.fetch_trades(symbol, since=last_ts)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -130,8 +129,7 @@ async def _fetch_trades_loop(
             if key in seen:
                 continue
             seen.add(key)
-            if last_ts is None or tr.timestamp_ms > last_ts:
-                last_ts = tr.timestamp_ms
+            last_ts = max(last_ts, tr.timestamp_ms)
             stats.trades_received += 1
             writer.append(tr)
             stats.trades_written += 1
