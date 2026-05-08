@@ -1,0 +1,259 @@
+"""Async public-trade collector.
+
+For each (exchange, symbol) the collector spawns one task that either:
+
+* uses ``ccxt.pro``'s ``watchTrades`` when available, or
+* falls back to polling ``fetchTrades`` over REST.
+
+Trades are forwarded to a single :class:`TradeWriter` which buffers and
+persists them to parquet. The collector exits cleanly after
+``CollectorConfig.duration`` seconds or when cancelled.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import structlog
+
+from .config import Config
+from .exchanges import ExchangeHandle, close_handle, has_market, make_handle
+from .storage import Trade, TradeWriter
+
+log = structlog.get_logger(__name__)
+
+
+@dataclass(slots=True)
+class CollectionStats:
+    trades_received: int = 0
+    trades_written: int = 0
+    errors: int = 0
+
+
+def _normalise_trade(exchange_id: str, symbol: str, raw: dict[str, Any]) -> Trade | None:
+    """Convert a ccxt trade dict into our internal :class:`Trade` shape.
+
+    Returns ``None`` when the trade is missing fields we cannot recover from.
+    """
+
+    ts = raw.get("timestamp")
+    price = raw.get("price")
+    amount = raw.get("amount")
+    if ts is None or price is None or amount is None:
+        return None
+    side = raw.get("side") or "unknown"
+    trade_id = raw.get("id") or ""
+    try:
+        return Trade(
+            timestamp_ms=int(ts),
+            exchange=exchange_id,
+            symbol=symbol,
+            price=float(price),
+            amount=float(amount),
+            side=str(side),
+            trade_id=str(trade_id),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+async def _watch_trades_loop(
+    handle: ExchangeHandle,
+    symbol: str,
+    writer: TradeWriter,
+    stats: CollectionStats,
+    stop_event: asyncio.Event,
+) -> None:
+    client = handle.client
+    while not stop_event.is_set():
+        try:
+            trades: list[dict[str, Any]] = await client.watch_trades(symbol)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stats.errors += 1
+            log.warning(
+                "watch_trades error",
+                exchange=handle.exchange_id,
+                symbol=symbol,
+                error=str(exc),
+            )
+            await asyncio.sleep(1.0)
+            continue
+        for raw in trades:
+            tr = _normalise_trade(handle.exchange_id, symbol, raw)
+            if tr is None:
+                continue
+            stats.trades_received += 1
+            writer.append(tr)
+            stats.trades_written += 1
+
+
+async def _fetch_trades_loop(
+    handle: ExchangeHandle,
+    symbol: str,
+    writer: TradeWriter,
+    stats: CollectionStats,
+    stop_event: asyncio.Event,
+    poll_interval: float,
+) -> None:
+    client = handle.client
+    seen: set[str] = set()
+    last_ts: int | None = None
+    while not stop_event.is_set():
+        try:
+            params: dict[str, Any] = {}
+            if last_ts is not None:
+                params["since"] = last_ts
+            trades: list[dict[str, Any]] = await client.fetch_trades(symbol, params=params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stats.errors += 1
+            log.warning(
+                "fetch_trades error",
+                exchange=handle.exchange_id,
+                symbol=symbol,
+                error=str(exc),
+            )
+            await asyncio.sleep(poll_interval * 2)
+            continue
+        for raw in trades:
+            tr = _normalise_trade(handle.exchange_id, symbol, raw)
+            if tr is None:
+                continue
+            key = f"{tr.timestamp_ms}-{tr.trade_id}-{tr.price}-{tr.amount}"
+            if key in seen:
+                continue
+            seen.add(key)
+            if last_ts is None or tr.timestamp_ms > last_ts:
+                last_ts = tr.timestamp_ms
+            stats.trades_received += 1
+            writer.append(tr)
+            stats.trades_written += 1
+        # Bound the dedup set so memory stays flat over long runs.
+        if len(seen) > 100_000:
+            seen = set(list(seen)[-50_000:])
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+
+
+async def _run_for_symbol(
+    handle: ExchangeHandle,
+    symbol: str,
+    writer: TradeWriter,
+    stats: CollectionStats,
+    stop_event: asyncio.Event,
+    rest_poll_interval: float,
+) -> None:
+    if not await has_market(handle, symbol):
+        log.info(
+            "skipping symbol - not listed on exchange",
+            exchange=handle.exchange_id,
+            symbol=symbol,
+        )
+        return
+    if handle.supports_watch_trades:
+        await _watch_trades_loop(handle, symbol, writer, stats, stop_event)
+    else:
+        await _fetch_trades_loop(handle, symbol, writer, stats, stop_event, rest_poll_interval)
+
+
+def _instantiate_handles(config: Config) -> list[ExchangeHandle]:
+    handles: list[ExchangeHandle] = []
+    for exchange_id in config.exchanges:
+        try:
+            handle = make_handle(
+                exchange_id,
+                prefer_websocket=config.collector.prefer_websocket,
+                rate_limit_safety=config.collector.rate_limit_safety,
+            )
+        except ValueError as exc:
+            log.warning("skipping unsupported exchange", exchange=exchange_id, error=str(exc))
+            continue
+        handles.append(handle)
+    return handles
+
+
+def _spawn_tasks(
+    config: Config,
+    handles: list[ExchangeHandle],
+    writer: TradeWriter,
+    stats: CollectionStats,
+    stop_event: asyncio.Event,
+) -> list[asyncio.Task[None]]:
+    tasks: list[asyncio.Task[None]] = []
+    for handle in handles:
+        for symbol in config.symbols:
+            task = asyncio.create_task(
+                _run_for_symbol(
+                    handle,
+                    symbol,
+                    writer,
+                    stats,
+                    stop_event,
+                    config.collector.rest_poll_interval,
+                ),
+                name=f"collect-{handle.exchange_id}-{symbol}",
+            )
+            tasks.append(task)
+    return tasks
+
+
+async def _await_deadline(stop_event: asyncio.Event, deadline: float) -> None:
+    while time.monotonic() < deadline:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            return
+        except TimeoutError:
+            continue
+
+
+async def _shutdown(
+    tasks: list[asyncio.Task[None]],
+    handles: list[ExchangeHandle],
+    writer: TradeWriter,
+    stop_event: asyncio.Event,
+) -> None:
+    stop_event.set()
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    for handle in handles:
+        try:
+            await close_handle(handle)
+        except Exception as exc:
+            log.warning("error closing handle", exchange=handle.exchange_id, error=str(exc))
+    writer.close()
+
+
+async def collect(config: Config) -> CollectionStats:
+    """Run the collector for ``config.collector.duration`` seconds.
+
+    Returns aggregate :class:`CollectionStats` once finished.
+    """
+
+    config.storage.data_dir.mkdir(parents=True, exist_ok=True)
+    writer = TradeWriter(data_dir=config.storage.data_dir)
+    stats = CollectionStats()
+    stop_event = asyncio.Event()
+
+    handles = _instantiate_handles(config)
+    if not handles:
+        log.error("no usable exchanges; aborting collection")
+        return stats
+
+    tasks = _spawn_tasks(config, handles, writer, stats, stop_event)
+    deadline = time.monotonic() + config.collector.duration
+    try:
+        await _await_deadline(stop_event, deadline)
+    finally:
+        await _shutdown(tasks, handles, writer, stop_event)
+
+    return stats
