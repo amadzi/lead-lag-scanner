@@ -19,19 +19,78 @@ The tool is split into three independent stages so you can re-run any of them:
 > orders. Use the output as input to a separate execution engine (Rust / Go /
 > Node / Python) that you control.
 
-## Quick start
+## Quick start (macOS — Mac 2022, M1/M2 or Intel)
 
 ```bash
-# Install (uv recommended; pip works too)
+# 1. Install Homebrew if you don't have it
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. Install uv (fast Python package manager) and git
+brew install uv git
+
+# 3. Clone this repo
+git clone https://github.com/amadzi/lead-lag-scanner.git
+cd lead-lag-scanner
+
+# 4. Install dependencies (creates a local .venv automatically)
 uv sync
 
-# Collect 1 hour of public trades from defaults (BTC/USDT, ETH/USDT on a few exchanges)
-uv run lead-lag-scanner collect --duration 3600
+# 5. (optional) Add the WebSocket extra for ccxt.pro - faster, lower-latency
+#    Without this you fall back to REST polling, which is fine but slower.
+uv sync --extra ws
 
-# Analyze whatever was collected and emit a markdown report
+# 6. Collect 1 hour of public trades from the default exchange set (~28 exchanges)
+uv run lead-lag-scanner collect
+
+# 7. Analyze + emit reports
 uv run lead-lag-scanner analyze
 uv run lead-lag-scanner report
+
+# Or do all three in one shot:
+uv run lead-lag-scanner run
 ```
+
+After the run, look at:
+- `reports/report.md` — human-readable Markdown table sorted by `|corr|`.
+- `reports/leaders.json` — machine-readable, one entry per pair.
+- `data/trades/<exchange>/<YYYY-MM-DD>.parquet` — raw tick data, re-analyzable.
+
+### Tuning for your run
+
+The default config (`config/default.yaml`) is reasonable but you'll likely
+want to override:
+
+- **Duration** — defaults to 3600 s (1 hour). For a quick test, override at the
+  CLI: `uv run lead-lag-scanner collect --duration 600` (10 min).
+- **Symbols** — defaults to `BTC/USDT`, `ETH/USDT`, `SOL/USDT`. Edit
+  `config/default.yaml` or pass your own `--config` YAML.
+- **Exchanges** — 28 curated by default; some may be geo-blocked from your
+  ISP (in which case the collector logs a warning and skips them). To run on
+  a smaller set, copy `config/default.yaml` and trim the list.
+
+### Running in the background (e.g. overnight)
+
+```bash
+nohup uv run lead-lag-scanner collect --duration 86400 > collect.log 2>&1 &
+echo $! > collect.pid
+
+# Watch progress:
+tail -f collect.log
+
+# Stop early (clean shutdown - parquet files are flushed):
+kill -TERM $(cat collect.pid)
+```
+
+### Troubleshooting
+
+- **"skipping symbol - not listed on exchange"** — normal, that exchange
+  doesn't carry that pair. Other exchanges still collect.
+- **"ExchangeNotAvailable / 451 / 403"** — that exchange is geo-blocked from
+  your IP. Ignore or remove from config. From a US IP, Binance/Bybit/MEXC
+  are commonly blocked. From the EU you usually have access to all 28.
+- **No pairs in report** — try lowering `report.min_abs_correlation` in your
+  config (default 0.4) or `analyzer.min_obs` (default 600 = 10 min). For
+  short collections (<10 min) reduce both.
 
 The default configuration lives at `config/default.yaml`.
 

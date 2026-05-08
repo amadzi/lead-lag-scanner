@@ -2,7 +2,12 @@
 # Copy this file and pass --config <path> to override any field.
 
 exchanges:
-  # ccxt ids; only public endpoints are used.
+  # ccxt ids; only public endpoints are used. The collector silently skips
+  # (exchange, symbol) pairs whose market is not listed, so listing 30
+  # exchanges where 5 don't carry SOL/USDT is fine - you just get fewer
+  # rows in the report. More exchanges = more chances to find lead-lag.
+  #
+  # Tier 1 - top-volume CEX
   - binance
   - okx
   - bybit
@@ -13,6 +18,28 @@ exchanges:
   - htx
   - coinbase
   - kraken
+  # Tier 2 - solid USDT liquidity
+  - bingx
+  - bitmart
+  - cryptocom
+  - lbank
+  - whitebit
+  - poloniex
+  - ascendex
+  - phemex
+  - woo
+  - bitfinex
+  - coinex
+  - bitrue
+  - hitbtc
+  - toobit
+  - hashkey
+  - upbit
+  - digifinex
+  # Tier 3 - USD-quote primary but also list BTC/USDT
+  - bitstamp
+  - gemini
+  - exmo
 
 symbols:
   # Must be expressible on every exchange in the list above. The collector will

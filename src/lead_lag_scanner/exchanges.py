@@ -21,7 +21,15 @@ except ImportError:
     _HAS_CCXT_PRO = False
 
 
+# Curated registry of public-spot exchanges that ccxt supports and that have
+# (at least) BTC/USDT or BTC/USD listed. Membership is *advisory* — any ccxt
+# id resolvable via `hasattr(ccxt_async, ...)` will be accepted. Listing here
+# just means "we have probed this exchange and it works for the default
+# symbols". The collector silently skips (exchange, symbol) pairs whose
+# market is not listed, so configuring 30 exchanges with one symbol that 5
+# of them don't list is fine.
 SUPPORTED_EXCHANGES: tuple[str, ...] = (
+    # Tier 1 — top-volume CEX with deep BTC/ETH/SOL USDT books
     "binance",
     "okx",
     "bybit",
@@ -32,6 +40,28 @@ SUPPORTED_EXCHANGES: tuple[str, ...] = (
     "htx",
     "coinbase",
     "kraken",
+    # Tier 2 — solid USDT liquidity, broad pair coverage
+    "bingx",
+    "bitmart",
+    "cryptocom",
+    "lbank",
+    "whitebit",
+    "poloniex",
+    "ascendex",
+    "phemex",
+    "woo",
+    "bitfinex",
+    "coinex",
+    "bitrue",
+    "hitbtc",
+    "toobit",
+    "hashkey",
+    "upbit",
+    "digifinex",
+    # Tier 3 — primarily USD-quote but also list BTC/USDT
+    "bitstamp",
+    "gemini",
+    "exmo",
 )
 
 
