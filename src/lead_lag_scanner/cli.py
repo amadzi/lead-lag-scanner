@@ -2,10 +2,11 @@
 
 Usage::
 
-    lead-lag-scanner collect [--config PATH] [--duration SECONDS]
-    lead-lag-scanner analyze [--config PATH]
-    lead-lag-scanner report  [--config PATH]
-    lead-lag-scanner run     [--config PATH] [--duration SECONDS]   # all three
+    lead-lag-scanner collect   [--config PATH] [--duration SECONDS]
+    lead-lag-scanner analyze   [--config PATH]
+    lead-lag-scanner report    [--config PATH]
+    lead-lag-scanner dashboard [--config PATH] [--top N] [--sort KEY] [--strict]
+    lead-lag-scanner run       [--config PATH] [--duration SECONDS]
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from . import __version__
 from .analyzer import analyze_all
 from .collector import collect
 from .config import Config, load_config
+from .dashboard import run_dashboard
 from .reporter import write_reports
 from .storage import build_duckdb_view, load_trades
 
@@ -146,6 +148,76 @@ def build_duckdb_cmd(config_path: Path | None) -> None:
     config = load_config(config_path)
     build_duckdb_view(config.storage.data_dir, config.storage.duckdb_path)
     click.echo(f"created {config.storage.duckdb_path}", err=True)
+
+
+@cli.command(
+    "dashboard",
+    help="Live terminal dashboard: re-reads trades and re-ranks pairs every N seconds.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+)
+@click.option(
+    "--refresh",
+    type=float,
+    default=None,
+    help="Seconds between refreshes (overrides dashboard.refresh_seconds).",
+)
+@click.option(
+    "--top",
+    "top_k",
+    type=int,
+    default=None,
+    help="Number of pairs to display (overrides dashboard.top_k).",
+)
+@click.option(
+    "--sort",
+    "sort_by",
+    type=click.Choice(["edge_bps", "abs_corr", "n_obs", "lag_abs"]),
+    default=None,
+    help="Sort column (overrides dashboard.sort_by).",
+)
+@click.option(
+    "--only-directional",
+    is_flag=True,
+    default=False,
+    help="Only show pairs with a non-zero leader/follower lag.",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    default=False,
+    help="Use the report-grade min_obs / min_abs_correlation instead of the dashboard defaults.",
+)
+def dashboard_cmd(
+    config_path: Path | None,
+    refresh: float | None,
+    top_k: int | None,
+    sort_by: str | None,
+    only_directional: bool,
+    strict: bool,
+) -> None:
+    config = load_config(config_path)
+    dash = config.dashboard
+    if refresh is not None:
+        dash = replace(dash, refresh_seconds=refresh)
+    if top_k is not None:
+        dash = replace(dash, top_k=top_k)
+    if sort_by is not None:
+        dash = replace(dash, sort_by=sort_by)
+    if only_directional:
+        dash = replace(dash, only_directional=True)
+    if strict:
+        dash = replace(
+            dash,
+            min_obs=config.analyzer.min_obs,
+            min_abs_correlation=config.report.min_abs_correlation,
+            bootstrap_n_iter=config.analyzer.bootstrap.n_iter,
+        )
+    run_dashboard(replace(config, dashboard=dash))
 
 
 @cli.command("run", help="collect → analyze → report in one shot.")

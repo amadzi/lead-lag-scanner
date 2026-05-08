@@ -69,11 +69,46 @@ exchanges:
   - zebpay
 
 symbols:
-  # Must be expressible on every exchange in the list above. The collector will
-  # skip any (exchange, symbol) pair where the market does not exist.
+  # ccxt unified symbols. The collector silently skips (exchange, symbol)
+  # pairs whose market is not listed on that exchange, so it is *safe* to
+  # add symbols that exist on only some venues. Memecoins / shitcoins were
+  # picked by probing ccxt for which USDT-quoted pairs are listed on >=15
+  # of the configured exchanges (see scripts/probe-symbols.py if you want
+  # to refresh the list).
+  #
+  # Sanity / volume floor
   - BTC/USDT
   - ETH/USDT
   - SOL/USDT
+  # Memecoin majors
+  - DOGE/USDT
+  - SHIB/USDT
+  - PEPE/USDT
+  - WIF/USDT
+  - BONK/USDT
+  - FLOKI/USDT
+  # 2024-2025 hot-rotation memes
+  - TRUMP/USDT
+  - PUMP/USDT
+  - VIRTUAL/USDT
+  - PNUT/USDT
+  - MOODENG/USDT
+  - FARTCOIN/USDT
+  - POPCAT/USDT
+  - BRETT/USDT
+  - BOME/USDT
+  - TURBO/USDT
+  - MEW/USDT
+  - GOAT/USDT
+  # Volatile alt-L1 / themed picks (often correlated with memes during pumps)
+  - SUI/USDT
+  - APT/USDT
+  - SEI/USDT
+  - TIA/USDT
+  - INJ/USDT
+  - ORDI/USDT
+  - WLD/USDT
+  - AIXBT/USDT
 
 collector:
   # How long (in seconds) `collect` should record before exiting.
@@ -82,9 +117,14 @@ collector:
   # 1.5 = wait 50% longer between requests).
   rate_limit_safety: 1.2
   # If true, prefer ccxt.pro websocket `watchTrades`; otherwise REST polling.
+  # Highly recommended when collecting >10 symbols across many exchanges:
+  # REST polling at 1s × 51 exchanges × 30 symbols can hit rate limits.
+  # Install with `uv sync --extra ws`.
   prefer_websocket: true
   # REST polling interval in seconds (only used when websocket is unavailable).
-  rest_poll_interval: 1.0
+  # Bumped to 2s by default so REST-only mode stays under per-exchange limits
+  # when the symbol list is large.
+  rest_poll_interval: 2.0
 
 storage:
   # Where to persist collected trades. Both relative and absolute paths work.
@@ -116,3 +156,18 @@ report:
   json_path: reports/leaders.json
   # Drop pairs whose absolute correlation is below this threshold.
   min_abs_correlation: 0.4
+
+dashboard:
+  # Live terminal dashboard (`lead-lag-scanner dashboard`). Defaults are
+  # *looser* than `analyzer.min_obs` and `report.min_abs_correlation` so the
+  # dashboard surfaces preliminary signal a few minutes after collection
+  # starts. Use `--strict` (or override here) to apply report-grade thresholds.
+  refresh_seconds: 30
+  top_k: 30
+  # One of: edge_bps, abs_corr, n_obs, lag_abs.
+  sort_by: edge_bps
+  min_abs_correlation: 0.3
+  min_obs: 60
+  bootstrap_n_iter: 30
+  # If true, hide pairs with leader == "none" (zero-lag, no directional edge).
+  only_directional: false

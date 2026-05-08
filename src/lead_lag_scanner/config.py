@@ -60,6 +60,26 @@ class ReportConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DashboardConfig:
+    """Live terminal dashboard knobs.
+
+    The dashboard re-reads the parquet shards and re-runs the analyzer on a
+    fixed schedule, then renders the top-K pairs sorted by ``sort_by``.
+    Defaults are deliberately *looser* than :class:`ReportConfig` /
+    :class:`AnalyzerConfig` so the dashboard shows preliminary signal a few
+    minutes after collection starts (instead of waiting for ``min_obs=600``).
+    """
+
+    refresh_seconds: float = 30.0
+    top_k: int = 30
+    sort_by: str = "edge_bps"  # one of: edge_bps, abs_corr, n_obs, lag_abs
+    min_abs_correlation: float = 0.3
+    min_obs: int = 60
+    bootstrap_n_iter: int = 30
+    only_directional: bool = False  # if True, drop pairs with leader == "none"
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     exchanges: tuple[str, ...]
     symbols: tuple[str, ...]
@@ -67,6 +87,7 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     analyzer: AnalyzerConfig = field(default_factory=AnalyzerConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
 
 
 def _coerce_path(value: Any, default: Path) -> Path:
@@ -118,6 +139,26 @@ def _load_report(d: dict[str, Any]) -> ReportConfig:
     )
 
 
+_DASHBOARD_SORT_KEYS = ("edge_bps", "abs_corr", "n_obs", "lag_abs")
+
+
+def _load_dashboard(d: dict[str, Any]) -> DashboardConfig:
+    sort_by = str(d.get("sort_by", "edge_bps"))
+    if sort_by not in _DASHBOARD_SORT_KEYS:
+        raise ValueError(
+            f"dashboard.sort_by must be one of {_DASHBOARD_SORT_KEYS}, got {sort_by!r}"
+        )
+    return DashboardConfig(
+        refresh_seconds=float(d.get("refresh_seconds", 30.0)),
+        top_k=int(d.get("top_k", 30)),
+        sort_by=sort_by,
+        min_abs_correlation=float(d.get("min_abs_correlation", 0.3)),
+        min_obs=int(d.get("min_obs", 60)),
+        bootstrap_n_iter=int(d.get("bootstrap_n_iter", 30)),
+        only_directional=bool(d.get("only_directional", False)),
+    )
+
+
 def load_config(path: Path | str | None = None) -> Config:
     """Load a :class:`Config` from a YAML file.
 
@@ -145,4 +186,5 @@ def load_config(path: Path | str | None = None) -> Config:
         storage=_load_storage(raw.get("storage") or {}),
         analyzer=_load_analyzer(raw.get("analyzer") or {}),
         report=_load_report(raw.get("report") or {}),
+        dashboard=_load_dashboard(raw.get("dashboard") or {}),
     )

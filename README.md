@@ -5,7 +5,7 @@ pairs where one exchange's price systematically moves *before* another's. Such
 pairs are the foundation of **latency-arbitrage** and **lead-lag** statistical
 strategies.
 
-The tool is split into three independent stages so you can re-run any of them:
+The tool is split into four independent stages so you can re-run any of them:
 
 1. **`collect`** — stream public trades over WebSocket / REST from a configurable
    list of exchanges and persist them to columnar storage (Parquet + DuckDB).
@@ -14,6 +14,9 @@ The tool is split into three independent stages so you can re-run any of them:
    correlation, and label the leader / follower.
 3. **`report`** — produce a Markdown summary plus a machine-readable
    `leaders.json` config that downstream execution bots can consume.
+4. **`dashboard`** — live terminal UI that re-reads the parquet shards and
+   re-ranks pairs by potential edge every N seconds, so you can watch
+   leadership emerge while `collect` is still running.
 
 > :warning: This repository is **research tooling** only. It does not place
 > orders. Use the output as input to a separate execution engine (Rust / Go /
@@ -39,7 +42,7 @@ uv sync
 #    Without this you fall back to REST polling, which is fine but slower.
 uv sync --extra ws
 
-# 6. Collect 1 hour of public trades from the default exchange set (~28 exchanges)
+# 6. Collect 1 hour of public trades from the default 51 exchanges × ~28 symbols
 uv run lead-lag-scanner collect
 
 # 7. Analyze + emit reports
@@ -48,7 +51,37 @@ uv run lead-lag-scanner report
 
 # Or do all three in one shot:
 uv run lead-lag-scanner run
+
+# 8. (recommended) Open the live dashboard in a SECOND terminal while
+#    `collect` is running in the first. Refreshes every 30s, sorted by
+#    potential edge in basis points.
+uv run lead-lag-scanner dashboard
 ```
+
+### Live dashboard
+
+```bash
+# default: top 30 pairs sorted by edge_bps, 30s refresh
+uv run lead-lag-scanner dashboard
+
+# only show pairs with directional leadership (non-zero lag)
+uv run lead-lag-scanner dashboard --only-directional
+
+# sort by something else
+uv run lead-lag-scanner dashboard --sort abs_corr
+uv run lead-lag-scanner dashboard --sort lag_abs
+uv run lead-lag-scanner dashboard --sort n_obs
+
+# tighten thresholds to report-grade (min_obs=600, min_abs_corr=0.4)
+uv run lead-lag-scanner dashboard --strict
+
+# faster refresh + more rows
+uv run lead-lag-scanner dashboard --refresh 10 --top 50
+```
+
+The dashboard is read-only — it reuses the same parquet shards `collect`
+writes, so you can leave it running (or open multiple windows with different
+sort keys) while data is being recorded.
 
 After the run, look at:
 - `reports/report.md` — human-readable Markdown table sorted by `|corr|`.
@@ -62,11 +95,21 @@ want to override:
 
 - **Duration** — defaults to 3600 s (1 hour). For a quick test, override at the
   CLI: `uv run lead-lag-scanner collect --duration 600` (10 min).
-- **Symbols** — defaults to `BTC/USDT`, `ETH/USDT`, `SOL/USDT`. Edit
-  `config/default.yaml` or pass your own `--config` YAML.
-- **Exchanges** — 28 curated by default; some may be geo-blocked from your
+- **Symbols** — default set covers BTC / ETH / SOL plus high-volatility
+  memecoins (DOGE, SHIB, PEPE, WIF, BONK, FLOKI, TRUMP, PUMP, VIRTUAL, PNUT,
+  MOODENG, FARTCOIN, POPCAT, BRETT, BOME, TURBO, MEW, GOAT) and volatile
+  alt-L1 / themed picks (SUI, APT, SEI, TIA, INJ, ORDI, WLD, AIXBT). Edit
+  `config/default.yaml` or pass your own `--config` YAML to add or trim. The
+  collector silently skips any (exchange, symbol) pair that is not listed,
+  so adding a symbol that exists on only some venues is safe.
+- **Exchanges** — 51 curated by default; some may be geo-blocked from your
   ISP (in which case the collector logs a warning and skips them). To run on
   a smaller set, copy `config/default.yaml` and trim the list.
+- **Memecoins / shitcoins** — generally have *much* higher per-bar σ than BTC,
+  so the `edge_bps` proxy can be larger even with weaker correlation. The
+  trade-off is that liquidity is shallower and slippage matters more than for
+  majors — treat any memecoin signal as input to a real fee + impact backtest,
+  not as guaranteed PnL.
 
 ### Running in the background (e.g. overnight)
 
@@ -149,10 +192,13 @@ src/lead_lag_scanner/
     storage.py       # Parquet + DuckDB persistence
     analyzer.py      # lead-lag computation
     reporter.py      # Markdown + JSON output
+    dashboard.py     # live terminal dashboard (rich)
 tests/
     test_analyzer.py # property + golden-data tests on synthetic series
     test_storage.py
     test_config.py
+    test_reporter.py
+    test_dashboard.py
 ```
 
 ## License
