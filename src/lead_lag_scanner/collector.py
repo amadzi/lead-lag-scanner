@@ -173,6 +173,16 @@ def _instantiate_handles(config: Config) -> list[ExchangeHandle]:
         except ValueError as exc:
             log.warning("skipping unsupported exchange", exchange=exchange_id, error=str(exc))
             continue
+        except Exception as exc:
+            # ccxt constructors can raise a variety of errors (auth-required,
+            # network, version mismatch). We never want one bad exchange to
+            # abort the whole run.
+            log.warning(
+                "exchange constructor failed; skipping",
+                exchange=exchange_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            continue
         handles.append(handle)
     return handles
 
