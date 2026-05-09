@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lead-lag-scanner — веб-дашборд</title>
+  <style>
+    :root {
+      --bg: #0e1117;
+      --panel: #161b22;
+      --panel2: #1f242c;
+      --border: #2a313c;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --yellow: #d29922;
+      --pill: #21262d;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "SF Pro Text", system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      font-size: 14px; line-height: 1.45;
+    }
+    a { color: var(--accent); }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      gap: 16px; flex-wrap: wrap;
+    }
+    header h1 {
+      margin: 0; font-size: 18px; font-weight: 600;
+    }
+    header .meta {
+      display: flex; align-items: center; gap: 14px;
+      color: var(--muted); font-size: 13px;
+    }
+    header .meta b { color: var(--text); font-weight: 600; }
+    button, .btn {
+      background: var(--pill); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 12px; cursor: pointer; font-size: 13px;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+    button.primary:hover { filter: brightness(1.1); }
+    button.danger { color: var(--red); border-color: #4a1f23; }
+    main {
+      display: grid; grid-template-columns: 320px 1fr;
+      gap: 16px; padding: 16px 24px;
+    }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    aside {
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .panel {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .panel h2 {
+      margin: 0 0 10px 0; font-size: 13px; font-weight: 600;
+      letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted);
+    }
+    label.row {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; padding: 4px 0; cursor: pointer;
+    }
+    label.row input[type="checkbox"] { accent-color: var(--accent); }
+    .scroll {
+      max-height: 220px; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 10px; background: var(--panel2);
+    }
+    .scroll label.row { padding: 2px 0; font-size: 13px; }
+    .scroll label.row .pill {
+      font-size: 11px; color: var(--muted);
+      padding: 1px 6px; background: var(--pill); border-radius: 999px;
+    }
+    .row-input {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 4px;
+    }
+    .row-input input[type="text"], .row-input input[type="number"], .row-input select {
+      flex: 1;
+      background: var(--panel2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 10px; font-size: 13px; font-family: inherit;
+    }
+    .row-input input[type="range"] { flex: 1; accent-color: var(--accent); }
+    .small { font-size: 12px; color: var(--muted); }
+    .right { text-align: right; }
+    .table-wrap {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      overflow: hidden;
+    }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    thead th {
+      position: sticky; top: 0; background: var(--panel2); color: var(--muted);
+      text-align: left; padding: 10px 10px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600; font-size: 12px; letter-spacing: 0.03em;
+      text-transform: uppercase;
+      cursor: pointer; user-select: none; white-space: nowrap;
+    }
+    thead th.right { text-align: right; }
+    thead th.sorted { color: var(--accent); }
+    thead th.sorted::after {
+      content: " ▾"; font-size: 10px;
+    }
+    thead th.sorted.asc::after { content: " ▴"; }
+    tbody td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #1a1f27;
+      white-space: nowrap;
+    }
+    tbody td.right { text-align: right; }
+    tbody tr:hover { background: var(--panel2); }
+    .green { color: var(--green); font-weight: 600; }
+    .red { color: var(--red); font-weight: 600; }
+    .yellow { color: var(--yellow); }
+    .dim { color: var(--muted); }
+    .badge {
+      display: inline-block; padding: 1px 8px; border-radius: 999px;
+      font-size: 11px; font-weight: 600;
+      background: var(--pill); color: var(--text);
+    }
+    .empty {
+      padding: 60px 24px; text-align: center; color: var(--muted);
+    }
+    .empty h3 { color: var(--text); margin: 0 0 8px 0; }
+    footer {
+      padding: 14px 24px; color: var(--muted);
+      border-top: 1px solid var(--border); font-size: 12px;
+      display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    }
+    .toast {
+      position: fixed; bottom: 16px; right: 16px;
+      max-width: 360px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 14px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.4);
+      font-size: 13px; line-height: 1.4;
+      transform: translateY(100px); opacity: 0;
+      transition: transform 0.18s ease, opacity 0.18s ease;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.error { border-color: #4a1f23; }
+    .toast.ok { border-color: #1c4a2c; }
+
+    .tickers-list {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
+    }
+    .ticker-pill {
+      background: var(--pill); border: 1px solid var(--border);
+      border-radius: 999px; padding: 3px 10px;
+      font-size: 12px; display: inline-flex; gap: 6px; align-items: center;
+    }
+    .ticker-pill button {
+      background: none; border: none; color: var(--muted);
+      padding: 0; cursor: pointer; font-size: 14px; line-height: 1;
+    }
+    .ticker-pill button:hover { color: var(--red); }
+
+    details {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 0;
+    }
+    details > summary {
+      list-style: none; cursor: pointer; padding: 12px 16px;
+      font-size: 13px; font-weight: 600; color: var(--muted);
+      letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    details > summary::-webkit-details-marker { display: none; }
+    details[open] > summary { border-bottom: 1px solid var(--border); }
+    details > .body { padding: 12px 16px; }
+    .help-text { color: var(--muted); font-size: 12px; line-height: 1.5; }
+
+    .stat-grid {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px;
+    }
+    @media (max-width: 700px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+    .stat {
+      background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px 12px;
+    }
+    .stat .v { font-size: 20px; font-weight: 600; line-height: 1.2; }
+    .stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📡 lead-lag-scanner</h1>
+  <div class="meta">
+    <span>обновлено: <b id="updatedAt">—</b></span>
+    <span>трейдов: <b id="nTrades">0</b></span>
+    <span>пар: <b id="nPairs">0</b></span>
+    <label class="row" title="Авто-обновление каждые 30с">
+      <input type="checkbox" id="autoRefresh" checked>
+      <span>авто</span>
+    </label>
+    <button id="refreshBtn" class="primary">Обновить</button>
+  </div>
+</header>
+
+<main>
+
+  <aside>
+    <div class="panel">
+      <h2>Фильтры</h2>
+
+      <div style="margin-bottom: 8px;">
+        <div class="small" style="margin-bottom: 4px;">Сортировка</div>
+        <div class="row-input">
+          <select id="sortBy">
+            <option value="edge_bps">Эдж (bps)</option>
+            <option value="abs_corr">|Корреляция|</option>
+            <option value="n_obs">Наблюдений</option>
+            <option value="lag_abs">|Лаг|</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 8px;">
+        <div class="small" style="margin-bottom: 4px;">
+          Минимум |корреляции|: <b id="minCorrLabel">0.30</b>
+        </div>
+        <div class="row-input">
+          <input type="range" id="minCorr" min="0" max="1" step="0.05" value="0.30">
+        </div>
+      </div>
+
+      <div style="margin-bottom: 8px;">
+        <div class="small" style="margin-bottom: 4px;">Минимум наблюдений (бар, сек)</div>
+        <div class="row-input">
+          <input type="number" id="minObs" min="0" max="100000" step="10" value="60">
+        </div>
+      </div>
+
+      <label class="row" style="margin-top: 6px;">
+        <span>Только направленные (без CI вокруг 0)</span>
+        <input type="checkbox" id="onlyDirectional">
+      </label>
+
+      <div style="margin-top: 10px;">
+        <div class="small" style="margin-bottom: 4px;">Лимит строк</div>
+        <div class="row-input">
+          <input type="number" id="limit" min="10" max="2000" step="10" value="200">
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Биржи</h2>
+      <div class="row-input" style="margin-bottom: 6px;">
+        <input type="text" id="exFilter" placeholder="поиск…">
+        <button id="exAll" title="Выбрать все">все</button>
+        <button id="exNone" title="Снять выбор">∅</button>
+      </div>
+      <div id="exchangesBox" class="scroll"></div>
+      <div class="small" id="exMeta" style="margin-top: 6px;">—</div>
+    </div>
+
+    <div class="panel">
+      <h2>Монеты</h2>
+      <div class="row-input" style="margin-bottom: 6px;">
+        <input type="text" id="symFilter" placeholder="поиск (например, PEPE)…">
+        <button id="symAll" title="Выбрать все">все</button>
+        <button id="symNone" title="Снять выбор">∅</button>
+      </div>
+      <div id="symbolsBox" class="scroll"></div>
+      <div class="small" id="symMeta" style="margin-top: 6px;">—</div>
+    </div>
+
+    <div class="panel">
+      <h2>Добавить тикер</h2>
+      <div class="row-input">
+        <input type="text" id="newSymbol" placeholder="BTC/USDT">
+        <button id="addSymbolBtn" class="primary">+</button>
+      </div>
+      <div class="small" style="margin-top: 6px;">
+        Формат: <code>BASE/USDT</code>. Тикер запишется в
+        <code>data/runtime-symbols.yaml</code> и будет использоваться при
+        следующем запуске <code>collect</code>.
+      </div>
+      <div class="tickers-list" id="runtimeTickers"></div>
+    </div>
+  </aside>
+
+  <section>
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="l">бирж в конфиге</div>
+        <div class="v" id="statExConfigured">—</div>
+      </div>
+      <div class="stat">
+        <div class="l">бирж с трейдами</div>
+        <div class="v" id="statExWithData">—</div>
+      </div>
+      <div class="stat">
+        <div class="l">тикеров в конфиге</div>
+        <div class="v" id="statSymConfigured">—</div>
+      </div>
+      <div class="stat">
+        <div class="l">пар выше порогов</div>
+        <div class="v" id="statPairs">—</div>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th data-sort="symbol">Монета</th>
+            <th data-sort="leader">Лидер</th>
+            <th data-sort="follower">Ведомый</th>
+            <th class="right" data-sort="best_lag_seconds">Лаг (с)</th>
+            <th class="right">CI (с)</th>
+            <th class="right" data-sort="abs_correlation">|Корр|</th>
+            <th class="right" data-sort="correlation_at_zero">Корр@0</th>
+            <th class="right" data-sort="edge_bps">Эдж (bps)</th>
+            <th class="right" data-sort="n_obs">N</th>
+            <th class="right" title="Доля баров с реальным трейдом">A/B%</th>
+          </tr>
+        </thead>
+        <tbody id="pairsBody"></tbody>
+      </table>
+      <div id="emptyHint" class="empty" style="display:none;">
+        <h3>Пока нет данных</h3>
+        <p>Запустите <code>uv run lead-lag-scanner collect</code> в другом
+          терминале и подождите 5–15 минут, чтобы накопить достаточно
+          трейдов для анализа.</p>
+        <p class="small">Если <code>collect</code> уже работает, проверьте,
+          что <code>storage.data_dir</code> в конфиге совпадает.</p>
+      </div>
+    </div>
+
+    <details style="margin-top: 16px;">
+      <summary>Качество данных по биржам</summary>
+      <div class="body">
+        <div class="help-text" style="margin-bottom: 8px;">
+          <code>transport_p50</code> — медиана <code>local_recv − exchange_ts</code>
+          (сетевой пинг + сдвиг часов биржи). Анализатор вычитает
+          консенсусную медиану из каждой биржи, чтобы устранить мнимые
+          лаги от рассинхрона часов. <code>clock_offset</code> — что
+          именно прибавили к меткам этой биржи.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Биржа</th>
+                <th class="right">Трейдов</th>
+                <th class="right">Transport p50 (мс)</th>
+                <th class="right">Clock offset (мс)</th>
+              </tr>
+            </thead>
+            <tbody id="diagBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
+    <details style="margin-top: 12px;">
+      <summary>Что эти числа значат</summary>
+      <div class="body help-text">
+        <p><b>Лидер / Ведомый</b> — биржа, чьи цены движутся первой /
+          второй внутри пары. Если <b>лаг = 0</b> и в CI попадает 0,
+          лидерство нестабильно (показано «—»).</p>
+        <p><b>|Корр|</b> — модуль корреляции лог-доходностей на лучшем
+          лаге. Чем больше, тем устойчивее связь. Ниже 0.3 в дашборде
+          фильтруется по умолчанию.</p>
+        <p><b>Корр@0</b> — корреляция без сдвига. Если ≈ |Корр|, лаг
+          околонулевой и сигнал про лидерство слабый.</p>
+        <p><b>Эдж (bps)</b> — наивный прокси:
+          <code>|Корр| × σ(ведомого) × 1e4 − 2 × тейкер-комиссия</code>.
+          Не PnL, не учитывает slippage и impact, но показывает порядок.</p>
+        <p><b>N</b> — секунд (баров) пересечения данных, где у обеих
+          бирж был реальный трейд. Чем больше, тем выше доверие.</p>
+        <p><b>A/B%</b> — доля «активных» баров для каждой стороны. Если
+          одна цифра низкая, биржа торгует тонко и данные форвард-филлятся
+          (но это уже отфильтровано анализатором, иначе пары бы здесь
+          не было).</p>
+      </div>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <div>
+    <span id="footError" class="red"></span>
+    <span id="cycle" class="small"></span>
+  </div>
+  <div class="small">
+    Открыто <b id="footHost">—</b>. Полные отчёты:
+    <code>reports/report.md</code>, <code>reports/leaders.json</code>.
+  </div>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const fmtPct = (x) => (x * 100).toFixed(0) + "%";
+const fmt2 = (x) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : (+x).toFixed(2);
+const fmt3 = (x) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : (+x).toFixed(3);
+const fmt1 = (x) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : (+x).toFixed(1);
+const fmtSign1 = (x) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : (x >= 0 ? "+" : "") + (+x).toFixed(1);
+
+function showToast(msg, kind) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "toast show " + (kind || "");
+  setTimeout(() => { el.className = "toast " + (kind || ""); }, 3500);
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const state = {
+  exchanges: [],   // string[]
+  symbols: [],     // string[]
+  selectedExchanges: new Set(),
+  selectedSymbols: new Set(),
+  exFilter: "",
+  symFilter: "",
+  sortBy: "edge_bps",
+  sortColumn: null,   // optional client-side override
+  sortAsc: false,
+  minCorr: 0.30,
+  minObs: 60,
+  onlyDirectional: false,
+  limit: 200,
+  refreshSeconds: 30,
+  taker: 10,
+  runtimeTickers: [],
+  exConfigured: 0,
+  exWithData: 0,
+  symConfigured: 0,
+  pairs: [],
+  diagnostics: [],
+  lastUpdate: "—",
+  lastError: null,
+  computeSeconds: 0,
+};
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (_) {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+async function loadState() {
+  try {
+    const s = await api("/api/state");
+    state.exchanges = s.exchanges_configured.slice();
+    state.symbols = s.symbols_configured.slice();
+    state.exConfigured = s.exchanges_configured.length;
+    state.exWithData = s.exchanges_with_trades.length;
+    state.symConfigured = s.symbols_configured.length;
+    state.refreshSeconds = s.refresh_seconds;
+    state.taker = s.taker_bps;
+    state.runtimeTickers = s.runtime_symbols.slice();
+    state.lastUpdate = s.computed_at;
+    state.lastError = s.last_error;
+    state.computeSeconds = s.last_compute_seconds;
+    if (state.selectedExchanges.size === 0)
+      state.exchanges.forEach(x => state.selectedExchanges.add(x));
+    if (state.selectedSymbols.size === 0)
+      state.symbols.forEach(x => state.selectedSymbols.add(x));
+    document.getElementById("statExConfigured").textContent = state.exConfigured;
+    document.getElementById("statExWithData").textContent = state.exWithData;
+    document.getElementById("statSymConfigured").textContent = state.symConfigured;
+    document.getElementById("statPairs").textContent = s.n_pairs;
+    document.getElementById("nTrades").textContent = s.n_trades.toLocaleString("ru");
+    document.getElementById("nPairs").textContent = s.n_pairs;
+    document.getElementById("updatedAt").textContent = s.computed_at;
+    renderExchanges();
+    renderSymbols();
+    renderRuntimeTickers();
+    if (s.last_error) {
+      document.getElementById("footError").textContent = "Ошибка: " + s.last_error;
+    } else {
+      document.getElementById("footError").textContent = "";
+    }
+    document.getElementById("cycle").textContent =
+      "цикл: " + (state.computeSeconds || 0).toFixed(2) + "с · обновление каждые " + state.refreshSeconds + "с";
+  } catch (e) {
+    showToast("Не получилось загрузить /api/state: " + e.message, "error");
+  }
+}
+
+async function loadPairs() {
+  const exSel = state.selectedExchanges.size === state.exchanges.length
+    ? null
+    : Array.from(state.selectedExchanges);
+  const symSel = state.selectedSymbols.size === state.symbols.length
+    ? null
+    : Array.from(state.selectedSymbols);
+  const params = new URLSearchParams();
+  params.set("sort_by", state.sortBy);
+  params.set("min_corr", state.minCorr);
+  params.set("min_obs", state.minObs);
+  params.set("only_directional", state.onlyDirectional ? "true" : "false");
+  params.set("limit", state.limit);
+  if (exSel) params.set("exchanges", exSel.join(","));
+  if (symSel) params.set("symbols", symSel.join(","));
+  try {
+    const p = await api("/api/pairs?" + params.toString());
+    state.pairs = p.pairs;
+    state.diagnostics = p.diagnostics;
+    document.getElementById("statPairs").textContent = p.n_filtered;
+    renderPairs();
+    renderDiagnostics();
+  } catch (e) {
+    showToast("Ошибка анализа: " + e.message, "error");
+  }
+}
+
+async function refreshAll() {
+  await loadState();
+  await loadPairs();
+}
+
+async function forceRefresh() {
+  try {
+    await api("/api/refresh", { method: "POST" });
+  } catch (e) {
+    showToast("Не удалось запустить пересчёт: " + e.message, "error");
+    return;
+  }
+  await refreshAll();
+  showToast("Пересчитано.", "ok");
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function renderExchanges() {
+  const box = document.getElementById("exchangesBox");
+  const filt = state.exFilter.toLowerCase();
+  const items = state.exchanges.filter(e => !filt || e.toLowerCase().includes(filt));
+  box.innerHTML = items.map(e => {
+    const checked = state.selectedExchanges.has(e) ? "checked" : "";
+    return `<label class="row"><span>${e}</span><input type="checkbox" data-ex="${e}" ${checked}></label>`;
+  }).join("");
+  document.getElementById("exMeta").textContent =
+    `${state.selectedExchanges.size} из ${state.exchanges.length} (${state.exWithData} с трейдами)`;
+  box.querySelectorAll("input[type=checkbox]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const ex = cb.dataset.ex;
+      if (cb.checked) state.selectedExchanges.add(ex); else state.selectedExchanges.delete(ex);
+      document.getElementById("exMeta").textContent =
+        `${state.selectedExchanges.size} из ${state.exchanges.length} (${state.exWithData} с трейдами)`;
+      loadPairs();
+    });
+  });
+}
+
+function renderSymbols() {
+  const box = document.getElementById("symbolsBox");
+  const filt = state.symFilter.toLowerCase();
+  const items = state.symbols.filter(s => !filt || s.toLowerCase().includes(filt));
+  box.innerHTML = items.map(s => {
+    const checked = state.selectedSymbols.has(s) ? "checked" : "";
+    return `<label class="row"><span>${s}</span><input type="checkbox" data-sym="${s}" ${checked}></label>`;
+  }).join("");
+  document.getElementById("symMeta").textContent =
+    `${state.selectedSymbols.size} из ${state.symbols.length}`;
+  box.querySelectorAll("input[type=checkbox]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const s = cb.dataset.sym;
+      if (cb.checked) state.selectedSymbols.add(s); else state.selectedSymbols.delete(s);
+      document.getElementById("symMeta").textContent =
+        `${state.selectedSymbols.size} из ${state.symbols.length}`;
+      loadPairs();
+    });
+  });
+}
+
+function renderRuntimeTickers() {
+  const box = document.getElementById("runtimeTickers");
+  if (state.runtimeTickers.length === 0) { box.innerHTML = ""; return; }
+  box.innerHTML = state.runtimeTickers.map(t =>
+    `<span class="ticker-pill">${t}<button data-rm="${t}" title="Удалить">×</button></span>`
+  ).join("");
+  box.querySelectorAll("button[data-rm]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const sym = btn.dataset.rm;
+      try {
+        const r = await api(`/api/symbols/${encodeURIComponent(sym)}`, { method: "DELETE" });
+        showToast(r.message || "Удалено.", "ok");
+        state.runtimeTickers = r.runtime_symbols;
+        renderRuntimeTickers();
+      } catch (e) {
+        showToast("Не получилось удалить: " + e.message, "error");
+      }
+    });
+  });
+}
+
+function edgeClass(edge) {
+  if (edge > 0) return "green";
+  if (edge > -2 * state.taker) return "yellow";
+  return "dim";
+}
+
+function renderPairs() {
+  const tbody = document.getElementById("pairsBody");
+  const empty = document.getElementById("emptyHint");
+  if (!state.pairs || state.pairs.length === 0) {
+    tbody.innerHTML = "";
+    empty.style.display = "block";
+    return;
+  }
+  empty.style.display = "none";
+  let pairs = state.pairs.slice();
+  if (state.sortColumn) {
+    const col = state.sortColumn;
+    pairs.sort((a, b) => {
+      const va = a[col], vb = b[col];
+      if (typeof va === "string") return state.sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+      return state.sortAsc ? (va - vb) : (vb - va);
+    });
+  }
+  tbody.innerHTML = pairs.map(p => {
+    const ci = (p.lag_ci_low_seconds === null || Number.isNaN(p.lag_ci_low_seconds))
+      ? "—"
+      : `[${fmtSign1(p.lag_ci_low_seconds)}, ${fmtSign1(p.lag_ci_high_seconds)}]`;
+    const cls = edgeClass(p.edge_bps);
+    const leader = p.leader === "none" ? '<span class="dim">—</span>' : `<span class="green">${p.leader}</span>`;
+    const follower = p.follower === "none" ? '<span class="dim">—</span>' : `<span class="red">${p.follower}</span>`;
+    const lagText = p.leader === "none"
+      ? `<span class="dim">${fmtSign1(p.best_lag_seconds)}</span>`
+      : fmtSign1(p.best_lag_seconds);
+    return `
+      <tr>
+        <td><b>${p.symbol}</b></td>
+        <td>${leader}</td>
+        <td>${follower}</td>
+        <td class="right">${lagText}</td>
+        <td class="right dim">${ci}</td>
+        <td class="right">${fmt3(p.abs_correlation)}</td>
+        <td class="right dim">${fmt3(p.correlation_at_zero)}</td>
+        <td class="right ${cls}">${fmtSign1(p.edge_bps)}</td>
+        <td class="right dim">${p.n_obs}</td>
+        <td class="right dim">${fmtPct(p.active_rate_a)}/${fmtPct(p.active_rate_b)}</td>
+      </tr>
+    `;
+  }).join("");
+
+  // sort indicators
+  document.querySelectorAll("thead th").forEach(th => {
+    th.classList.remove("sorted", "asc");
+    if (th.dataset.sort && th.dataset.sort === state.sortColumn) {
+      th.classList.add("sorted");
+      if (state.sortAsc) th.classList.add("asc");
+    }
+  });
+}
+
+function renderDiagnostics() {
+  const tbody = document.getElementById("diagBody");
+  if (!state.diagnostics || state.diagnostics.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="dim" style="padding:14px;text-align:center;">диагностика появится после первого пересчёта</td></tr>';
+    return;
+  }
+  tbody.innerHTML = state.diagnostics.map(d => `
+    <tr>
+      <td><b>${d.exchange}</b></td>
+      <td class="right">${d.n_trades.toLocaleString("ru")}</td>
+      <td class="right">${fmtSign1(d.transport_latency_p50_ms)}</td>
+      <td class="right">${fmtSign1(d.clock_offset_ms)}</td>
+    </tr>
+  `).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+document.getElementById("refreshBtn").addEventListener("click", forceRefresh);
+
+document.getElementById("autoRefresh").addEventListener("change", (e) => {
+  if (e.target.checked) startAuto(); else stopAuto();
+});
+
+document.getElementById("sortBy").addEventListener("change", (e) => {
+  state.sortBy = e.target.value;
+  state.sortColumn = null;  // clear client override
+  loadPairs();
+});
+document.getElementById("minCorr").addEventListener("input", (e) => {
+  state.minCorr = parseFloat(e.target.value);
+  document.getElementById("minCorrLabel").textContent = state.minCorr.toFixed(2);
+});
+document.getElementById("minCorr").addEventListener("change", () => loadPairs());
+document.getElementById("minObs").addEventListener("change", (e) => {
+  state.minObs = parseInt(e.target.value, 10) || 0;
+  loadPairs();
+});
+document.getElementById("onlyDirectional").addEventListener("change", (e) => {
+  state.onlyDirectional = e.target.checked;
+  loadPairs();
+});
+document.getElementById("limit").addEventListener("change", (e) => {
+  state.limit = Math.max(10, parseInt(e.target.value, 10) || 200);
+  loadPairs();
+});
+document.getElementById("exFilter").addEventListener("input", (e) => {
+  state.exFilter = e.target.value; renderExchanges();
+});
+document.getElementById("symFilter").addEventListener("input", (e) => {
+  state.symFilter = e.target.value; renderSymbols();
+});
+document.getElementById("exAll").addEventListener("click", () => {
+  state.exchanges.forEach(x => state.selectedExchanges.add(x));
+  renderExchanges(); loadPairs();
+});
+document.getElementById("exNone").addEventListener("click", () => {
+  state.selectedExchanges.clear();
+  renderExchanges(); loadPairs();
+});
+document.getElementById("symAll").addEventListener("click", () => {
+  state.symbols.forEach(x => state.selectedSymbols.add(x));
+  renderSymbols(); loadPairs();
+});
+document.getElementById("symNone").addEventListener("click", () => {
+  state.selectedSymbols.clear();
+  renderSymbols(); loadPairs();
+});
+
+document.querySelectorAll("thead th[data-sort]").forEach(th => {
+  th.addEventListener("click", () => {
+    const col = th.dataset.sort;
+    if (state.sortColumn === col) state.sortAsc = !state.sortAsc;
+    else { state.sortColumn = col; state.sortAsc = false; }
+    renderPairs();
+  });
+});
+
+document.getElementById("addSymbolBtn").addEventListener("click", async () => {
+  const inp = document.getElementById("newSymbol");
+  const value = inp.value.trim();
+  if (!value) { showToast("Введите тикер.", "error"); return; }
+  try {
+    const r = await api("/api/symbols", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ symbol: value }),
+    });
+    showToast(r.message || "Добавлено.", "ok");
+    inp.value = "";
+    state.runtimeTickers = r.runtime_symbols;
+    renderRuntimeTickers();
+  } catch (e) {
+    showToast("Не получилось добавить: " + e.message, "error");
+  }
+});
+document.getElementById("newSymbol").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("addSymbolBtn").click();
+});
+
+let autoTimer = null;
+function startAuto() {
+  stopAuto();
+  autoTimer = setInterval(refreshAll, Math.max(5, state.refreshSeconds || 30) * 1000);
+}
+function stopAuto() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+}
+
+document.getElementById("footHost").textContent = location.host;
+
+(async () => {
+  await refreshAll();
+  startAuto();
+})();
+</script>
+</body>
+</html>

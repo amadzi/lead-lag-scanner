@@ -7,7 +7,7 @@ catch typos in field names.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -193,6 +193,83 @@ def _load_dashboard(d: dict[str, Any]) -> DashboardConfig:
         bootstrap_n_iter=int(d.get("bootstrap_n_iter", 30)),
         only_directional=bool(d.get("only_directional", False)),
     )
+
+
+RUNTIME_SYMBOLS_FILENAME = "runtime-symbols.yaml"
+
+
+def runtime_symbols_path(data_dir: Path) -> Path:
+    """Return the path where user-added tickers are persisted."""
+
+    return Path(data_dir) / RUNTIME_SYMBOLS_FILENAME
+
+
+def load_runtime_symbols(data_dir: Path) -> tuple[str, ...]:
+    """Load extra tickers added through the web dashboard.
+
+    The file is a tiny YAML doc with a single ``symbols:`` list, e.g.::
+
+        symbols:
+          - PEPE/USDT
+          - WIF/USDT
+
+    Missing file ⇒ empty tuple. Malformed file ⇒ empty tuple (we never want
+    a stray runtime symbol file to break the collector).
+    """
+
+    path = runtime_symbols_path(data_dir)
+    if not path.exists():
+        return ()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw: dict[str, Any] = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError):
+        return ()
+    symbols = raw.get("symbols") or []
+    if not isinstance(symbols, list):
+        return ()
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in symbols:
+        s = str(item).strip()
+        if s and s not in seen:
+            cleaned.append(s)
+            seen.add(s)
+    return tuple(cleaned)
+
+
+def save_runtime_symbols(data_dir: Path, symbols: tuple[str, ...]) -> Path:
+    """Atomically persist the runtime ticker list to disk."""
+
+    path = runtime_symbols_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"symbols": list(symbols)}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+    tmp.replace(path)
+    return path
+
+
+def merge_runtime_symbols(config: Config) -> Config:
+    """Return a copy of ``config`` with ``runtime-symbols.yaml`` appended.
+
+    Order: configured symbols first (preserves the curated coverage-sorted
+    order), then runtime additions in insertion order, deduplicated.
+    """
+
+    extras = load_runtime_symbols(config.storage.data_dir)
+    if not extras:
+        return config
+    seen: set[str] = set(config.symbols)
+    merged: list[str] = list(config.symbols)
+    for s in extras:
+        if s not in seen:
+            merged.append(s)
+            seen.add(s)
+    if len(merged) == len(config.symbols):
+        return config
+    return replace(config, symbols=tuple(merged))
 
 
 def load_config(path: Path | str | None = None) -> Config:

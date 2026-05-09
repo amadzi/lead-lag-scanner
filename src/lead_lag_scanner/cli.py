@@ -21,6 +21,7 @@ from pathlib import Path
 
 import click
 import structlog
+import uvicorn
 
 from . import __version__
 from .analyzer import analyze_all_with_diagnostics
@@ -30,6 +31,7 @@ from .dashboard import run_dashboard
 from .exchanges import probe_usdt_symbols
 from .reporter import write_reports
 from .storage import build_duckdb_view, load_trades
+from .web import create_app
 
 _LOG_LEVEL_ENV = "LEAD_LAG_SCANNER_LOG_LEVEL"
 
@@ -229,6 +231,53 @@ def dashboard_cmd(
             bootstrap_n_iter=config.analyzer.bootstrap.n_iter,
         )
     run_dashboard(replace(config, dashboard=dash))
+
+
+@cli.command(
+    "web",
+    help="Start the in-browser dashboard (Russian UI, filters, manual ticker add).",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+)
+@click.option(
+    "--host",
+    type=str,
+    default="127.0.0.1",
+    show_default=True,
+    help="Host/interface to bind to. Use 0.0.0.0 to expose on the LAN.",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=8000,
+    show_default=True,
+    help="TCP port to listen on.",
+)
+@click.option(
+    "--refresh",
+    type=float,
+    default=None,
+    help="Seconds between background re-analysis cycles (overrides dashboard.refresh_seconds).",
+)
+def web_cmd(
+    config_path: Path | None,
+    host: str,
+    port: int,
+    refresh: float | None,
+) -> None:
+    config = load_config(config_path)
+    app = create_app(config, refresh_seconds=refresh)
+    click.echo(
+        f"web dashboard listening on http://{host}:{port}/  "
+        f"(refresh={refresh or config.dashboard.refresh_seconds:.0f}s, "
+        f"data_dir={config.storage.data_dir})",
+        err=True,
+    )
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 @cli.command("run", help="collect → analyze → report in one shot.")

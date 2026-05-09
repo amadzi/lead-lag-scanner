@@ -33,6 +33,8 @@ class CollectionStats:
     trades_written: int = 0
     errors: int = 0
     trades_dropped_drift: int = 0  # trades whose |local-exchange| > drift cap
+    pairs_active: int = 0  # (exchange, symbol) actually being collected
+    pairs_skipped: int = 0  # (exchange, symbol) skipped (not listed on exchange)
 
 
 # Trades whose exchange-reported timestamp differs from our local receive
@@ -188,12 +190,17 @@ async def _run_for_symbol(
     rest_poll_interval: float,
 ) -> None:
     if not await has_market(handle, symbol):
-        log.info(
+        # Demoted to debug: with 51 exchanges x 200 symbols this used to spam
+        # ~7000 "skipping" lines at startup. The aggregate pairs_active /
+        # pairs_skipped counters are surfaced once at startup instead.
+        stats.pairs_skipped += 1
+        log.debug(
             "skipping symbol - not listed on exchange",
             exchange=handle.exchange_id,
             symbol=symbol,
         )
         return
+    stats.pairs_active += 1
     if handle.supports_watch_trades:
         await _watch_trades_loop(handle, symbol, writer, stats, stop_event)
     else:
