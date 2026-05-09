@@ -15,6 +15,23 @@ from unittest.mock import MagicMock
 from lead_lag_scanner.collector import install_quiet_loop_handler
 
 
+def _raise_from_file(exc: BaseException, filename: str) -> BaseException:
+    """Return ``exc`` after raising it through a frame pretending to live in ``filename``.
+
+    Compiling ``raise __exc`` with an explicit ``filename`` and executing it
+    yields a traceback whose frames carry that ``co_filename``. We use this
+    to fabricate "this exception came from ccxt" stacks without depending on
+    ccxt at test time.
+    """
+
+    code = compile("raise __exc", filename, "exec")
+    try:
+        exec(code, {"__exc": exc})
+    except BaseException as caught:
+        return caught
+    raise AssertionError("compiled raise did not propagate")  # pragma: no cover
+
+
 def _drive(handler: Any, context: dict[str, Any]) -> dict[str, Any]:
     """Invoke ``handler`` against a fake loop and report what it forwarded."""
 
@@ -116,5 +133,55 @@ def test_install_is_idempotent() -> None:
         install_quiet_loop_handler(loop)
         second = _get_handler(loop)
         assert first is second
+    finally:
+        loop.close()
+
+
+def test_handler_drops_builtin_exception_with_ccxt_in_traceback() -> None:
+    """ccxt.pro htx.py raises AttributeError (builtins) — suppress via tb scan."""
+
+    loop = asyncio.new_event_loop()
+    try:
+        install_quiet_loop_handler(loop)
+        handler = _get_handler(loop)
+
+        exc = _raise_from_file(
+            AttributeError("'Client' object has no attribute 'reset'"),
+            "/site-packages/ccxt/pro/htx.py",
+        )
+
+        result = _drive(
+            handler,
+            {
+                "message": "Task exception was never retrieved",
+                "exception": exc,
+            },
+        )
+        assert result["default_called"] is False
+    finally:
+        loop.close()
+
+
+def test_handler_forwards_builtin_exception_with_no_ccxt_frame() -> None:
+    """Genuine bug in our own code (no ccxt frame) must still surface."""
+
+    loop = asyncio.new_event_loop()
+    try:
+        install_quiet_loop_handler(loop)
+        handler = _get_handler(loop)
+
+        exc = _raise_from_file(
+            AttributeError("'Foo' object has no attribute 'bar'"),
+            "/home/ubuntu/repos/myproject/src/widget.py",
+        )
+
+        result = _drive(
+            handler,
+            {
+                "message": "Task exception was never retrieved",
+                "exception": exc,
+            },
+        )
+        assert result["default_called"] is True
     finally:
         loop.close()

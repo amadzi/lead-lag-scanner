@@ -21,7 +21,14 @@ WebSocket / REST transport latency, and (c) drop trades whose
 Trades are buffered in memory and flushed to parquet files partitioned by
 ``exchange`` and ``date``::
 
-    <data_dir>/trades/<exchange>/<YYYY-MM-DD>.parquet
+    <data_dir>/trades/<exchange>/<YYYY-MM-DD>-<seq>.parquet
+
+Each flush writes a brand-new immutable file. Files are first written to a
+``.tmp`` sibling and atomically renamed into place via ``os.replace`` so a
+concurrent reader (e.g. the live web dashboard) only ever sees a complete
+parquet file with a valid footer. Legacy shards named
+``<YYYY-MM-DD>.parquet`` (without a ``-<seq>`` suffix) are still picked up
+by the read-side glob; new writes never touch them.
 
 A DuckDB database is created on demand (``build_duckdb_view``) and exposes a
 single view ``trades`` that unions every parquet shard. Old shards written
@@ -32,6 +39,10 @@ clock-skew calibration purposes.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +51,13 @@ import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+log = logging.getLogger(__name__)
+
+# Each parquet file we write is named ``YYYY-MM-DD-<8-digit-seq>.parquet``.
+# The regex is anchored against the filename stem so we never accidentally
+# parse a legacy ``YYYY-MM-DD.parquet`` shard as a sequence-suffixed one.
+_SHARD_FILENAME_RE = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})-(?P<seq>\d{8})$")
 
 TRADE_SCHEMA = pa.schema(
     [
@@ -73,7 +91,12 @@ class Trade:
 
 @dataclass(slots=True)
 class TradeWriter:
-    """Buffered parquet writer that flushes per-day shards.
+    """Buffered parquet writer that flushes immutable per-day shards.
+
+    Each ``flush()`` writes a fresh ``<YYYY-MM-DD>-<8-digit-seq>.parquet``
+    file via a temp-then-rename dance, so a concurrent reader (the live
+    web dashboard) only ever observes complete parquet files with valid
+    footers. Read paths simply glob ``trades/**/*.parquet``.
 
     Not thread-safe; create one writer per producer task.
     """
@@ -81,6 +104,11 @@ class TradeWriter:
     data_dir: Path
     flush_every: int = 1000
     _buffer: list[Trade] = field(default_factory=list)
+    # Per-(exchange, day) flush counter, kept in memory for the lifetime of
+    # the writer. ``_resolve_seq_floor`` seeds it from any pre-existing
+    # shards on disk so a restarted collector does not collide with files
+    # written in a previous run.
+    _seq: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def append(self, trade: Trade) -> None:
         self._buffer.append(trade)
@@ -90,7 +118,7 @@ class TradeWriter:
     def flush(self) -> None:
         if not self._buffer:
             return
-        # Group by (exchange, date) so we write each shard once.
+        # Group by (exchange, date) so each shard is written as one new file.
         groups: dict[tuple[str, str], list[Trade]] = {}
         for tr in self._buffer:
             day = datetime.fromtimestamp(tr.timestamp_ms / 1000.0, tz=UTC).strftime("%Y-%m-%d")
@@ -99,16 +127,60 @@ class TradeWriter:
         for (exchange, day), trades in groups.items():
             shard_dir = self.data_dir / "trades" / exchange
             shard_dir.mkdir(parents=True, exist_ok=True)
-            shard_path = shard_dir / f"{day}.parquet"
+            seq = self._next_seq(shard_dir, exchange, day)
+            final_path = shard_dir / f"{day}-{seq:08d}.parquet"
+            tmp_path = shard_dir / f".{day}-{seq:08d}.parquet.tmp"
             table = _trades_to_table(trades)
-            if shard_path.exists():
-                existing = _read_shard_promoting(shard_path)
-                table = pa.concat_tables([existing, table])
-            pq.write_table(table, shard_path, compression="zstd")
+            try:
+                pq.write_table(table, tmp_path, compression="zstd")
+                # ``os.replace`` is atomic on POSIX/NTFS for same-filesystem
+                # paths, so a reader that opens ``final_path`` either sees
+                # the previous file or the new one — never a half-written
+                # blob with a missing footer.
+                os.replace(tmp_path, final_path)
+            except Exception:
+                # If anything goes wrong (out-of-disk, perms), make sure we
+                # don't leave a stale ``.tmp`` lying around to confuse later
+                # debugging. We re-raise so the caller learns about it.
+                if tmp_path.exists():
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+                raise
         self._buffer.clear()
 
     def close(self) -> None:
         self.flush()
+
+    def _next_seq(self, shard_dir: Path, exchange: str, day: str) -> int:
+        key = (exchange, day)
+        if key not in self._seq:
+            self._seq[key] = self._resolve_seq_floor(shard_dir, day)
+        seq = self._seq[key]
+        self._seq[key] = seq + 1
+        return seq
+
+    @staticmethod
+    def _resolve_seq_floor(shard_dir: Path, day: str) -> int:
+        """Return the smallest free sequence number for ``day`` in ``shard_dir``.
+
+        Scans ``<day>-<seq>.parquet`` siblings and returns ``max(seq) + 1``,
+        falling back to ``0`` when none exist. Legacy ``<day>.parquet``
+        shards (without a sequence suffix) are intentionally ignored — the
+        new writer never overwrites them, and they are still read by
+        :func:`load_trades` via the directory glob.
+        """
+
+        max_seq = -1
+        for path in shard_dir.glob(f"{day}-*.parquet"):
+            match = _SHARD_FILENAME_RE.match(path.stem)
+            if match is None:
+                continue
+            try:
+                seq = int(match.group("seq"))
+            except ValueError:
+                continue
+            max_seq = max(max_seq, seq)
+        return max_seq + 1
 
 
 def _read_shard_promoting(path: Path) -> pa.Table:

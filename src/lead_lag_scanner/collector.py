@@ -37,6 +37,7 @@ _QUIET_HANDLER_INSTALLED = "_lead_lag_quiet_handler_installed"
 _SUPPRESSED_LOOP_MESSAGES: tuple[str, ...] = (
     "Future exception was never retrieved",
     "Task exception was never retrieved",
+    "Exception in callback Client.receive_loop",
 )
 
 # Module prefixes whose unhandled errors are dropped silently. ccxt errors
@@ -45,6 +46,30 @@ _SUPPRESSED_LOOP_MESSAGES: tuple[str, ...] = (
 # this file already logs and recovers from them, so re-printing is pure noise.
 _SUPPRESSED_EXC_MODULES: tuple[str, ...] = ("ccxt.",)
 
+# Path fragments that identify a frame as ccxt-internal. Some ccxt.pro
+# clients raise built-in exceptions (e.g. ``AttributeError`` from
+# ``ccxt/pro/htx.py:1921`` calling the non-existent ``client.reset(error)``)
+# whose ``__module__`` is ``builtins`` — we still want to swallow them
+# because they're library bugs that don't affect our pipeline.
+_CCXT_FRAME_FRAGMENTS: tuple[str, ...] = (
+    "/ccxt/",
+    "\\ccxt\\",
+    "/ccxt\\",
+    "\\ccxt/",
+)
+
+
+def _exception_originates_in_ccxt(exc: BaseException) -> bool:
+    """Return ``True`` when any frame in ``exc``'s traceback is from ccxt code."""
+
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = tb.tb_frame.f_code.co_filename
+        if any(frag in filename for frag in _CCXT_FRAME_FRAGMENTS):
+            return True
+        tb = tb.tb_next
+    return False
+
 
 def install_quiet_loop_handler(loop: asyncio.AbstractEventLoop | None = None) -> None:
     """Replace the running loop's default exception handler with a quieter one.
@@ -52,16 +77,18 @@ def install_quiet_loop_handler(loop: asyncio.AbstractEventLoop | None = None) ->
     The default ``asyncio`` handler prints a full traceback for every
     Future/Task whose exception is never retrieved. ``ccxt.pro`` schedules
     short-lived inner tasks for ws subscriptions whose lifetime we do not
-    directly own, so a routine ws disconnect (NetworkError 1006/1000) or a
-    schema mismatch on a single symbol (BadRequest from one exchange) ends up
-    surfacing here even though our outer retry loop already handled it.
+    directly own, so a routine ws disconnect (NetworkError 1006/1000), a
+    schema mismatch on a single symbol (BadRequest from one exchange), or a
+    library bug raising a built-in exception inside ccxt's own code (e.g.
+    htx's ``client.reset(error)`` typo) ends up surfacing here even though
+    our outer retry loop already handled it.
 
     The replacement handler:
-      * silently drops messages matching :data:`_SUPPRESSED_LOOP_MESSAGES`,
-      * silently drops exceptions raised from modules in
-        :data:`_SUPPRESSED_EXC_MODULES`,
-      * forwards everything else to the default handler so genuine bugs
-        (TypeError, KeyError, etc.) still surface.
+      * silently drops messages matching :data:`_SUPPRESSED_LOOP_MESSAGES`
+        when the underlying exception is either declared in ``ccxt.*`` or
+        was raised inside a ``/ccxt/`` source file,
+      * forwards everything else to the default handler so genuine bugs in
+        our own code (TypeError, KeyError, etc.) still surface.
 
     Idempotent: calling it twice on the same loop is a no-op.
     """
@@ -73,15 +100,13 @@ def install_quiet_loop_handler(loop: asyncio.AbstractEventLoop | None = None) ->
     def _handler(loop_obj: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
         msg = str(context.get("message", ""))
         exc = context.get("exception")
-        # Only suppress when BOTH the message matches the noisy pattern AND
-        # the exception originates in ccxt — that combination is exclusively
-        # ws/REST churn we already retry on. Anything else (including a
-        # matching message without an exception, which would be unusual)
-        # falls through to the default handler so it stays visible.
         if (
             exc is not None
             and any(token in msg for token in _SUPPRESSED_LOOP_MESSAGES)
-            and any(type(exc).__module__.startswith(p) for p in _SUPPRESSED_EXC_MODULES)
+            and (
+                any(type(exc).__module__.startswith(p) for p in _SUPPRESSED_EXC_MODULES)
+                or _exception_originates_in_ccxt(exc)
+            )
         ):
             return
         loop_obj.default_exception_handler(context)
@@ -109,6 +134,58 @@ class CollectionStats:
 # This is intentionally generous (1 hour) so that NTP-loose exchanges and
 # WebSocket reconnect bursts are still kept.
 _MAX_INGEST_DRIFT_MS: int = 3_600_000
+
+
+# Substrings (case-insensitive) that mark an error as *permanent* for a
+# given (exchange, symbol) pair. When we see one we log the failure once,
+# stop the loop, and never reschedule. Retrying these wastes CPU/network
+# and floods the log with identical traceback noise.
+#
+# Examples:
+#   - "requires apiKey"         → e.g. luno's watch_trades demands auth
+#   - "requires `apiKey`"       → ccxt variant of the same message
+#   - "is not supported"        → exchange doesn't expose this method
+#   - "NotSupported"            → ccxt's NotSupported exception text
+#   - "one symbol per instance" → cex.io ws limitation
+#   - "protobuf"                → mexc switched ws frames to protobuf, ccxt
+#                                 has not implemented the parser
+_PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
+    "requires apikey",
+    "is not supported",
+    "notsupported",
+    "one symbol per instance",
+    "protobuf",
+    "no such market",
+    "market is not active",
+    "subscribe to one symbol",
+)
+
+
+# Exponential backoff schedule (seconds) for transient errors in the watch /
+# fetch loops. We start at 1s, ramp up to 30s, and stay there. After any
+# successful iteration the backoff resets to the start of the schedule so a
+# brief blip doesn't penalise an exchange that recovered.
+_TRANSIENT_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 5.0, 15.0, 30.0)
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """Return ``True`` when ``exc`` matches a known unrecoverable pattern.
+
+    The match is intentionally loose (case-insensitive substring) because
+    different ccxt versions wrap the same underlying problem in slightly
+    different error strings, and we'd rather skip a borderline case than
+    spin on a hopeless retry forever.
+    """
+
+    lowered = str(exc).lower()
+    return any(pattern in lowered for pattern in _PERMANENT_ERROR_PATTERNS)
+
+
+def _next_backoff(current_index: int) -> tuple[float, int]:
+    """Return ``(sleep_seconds, next_index)`` for the transient retry schedule."""
+
+    idx = min(current_index, len(_TRANSIENT_BACKOFF_SECONDS) - 1)
+    return _TRANSIENT_BACKOFF_SECONDS[idx], idx + 1
 
 
 def _normalise_trade(
@@ -158,6 +235,7 @@ async def _watch_trades_loop(
 ) -> None:
     client = handle.client
     seen: set[str] = set()
+    backoff_idx = 0
     while not stop_event.is_set():
         try:
             trades: list[dict[str, Any]] = await client.watch_trades(symbol)
@@ -165,19 +243,38 @@ async def _watch_trades_loop(
             raise
         except Exception as exc:
             stats.errors += 1
+            if _is_permanent_error(exc):
+                # Log once at INFO and stop forever — there is no value in
+                # retrying a NotSupported / apiKey-required / protobuf-frame
+                # error every second on this (exchange, symbol) pair.
+                log.info(
+                    "watch_trades permanently disabled for symbol",
+                    exchange=handle.exchange_id,
+                    symbol=symbol,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return
+            sleep_for, backoff_idx = _next_backoff(backoff_idx)
             log.warning(
                 "watch_trades error",
                 exchange=handle.exchange_id,
                 symbol=symbol,
                 error=str(exc),
+                retry_in_s=sleep_for,
             )
-            await asyncio.sleep(1.0)
-            continue
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+                return
+            except TimeoutError:
+                continue
         # ccxt.pro delivers trades in batches; capture the local clock once
         # per batch so that trades sharing a single network frame share their
         # ``local_recv_ts_ns`` and clock-skew calibration is not biased by
         # how the analyzer iterates the batch.
         local_recv_ns = time.time_ns()
+        # Successful iteration: reset the transient backoff schedule so a
+        # one-off blip earlier in the run doesn't keep us in slow mode.
+        backoff_idx = 0
         for raw in trades:
             tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
@@ -208,6 +305,7 @@ async def _fetch_trades_loop(
     # Seed `since` to ~5 seconds ago so we don't pull historical archives from
     # exchanges (e.g. Kraken) that default to the first-ever trade.
     last_ts: int = int(time.time() * 1000) - 5_000
+    backoff_idx = 0
     while not stop_event.is_set():
         try:
             trades: list[dict[str, Any]] = await client.fetch_trades(symbol, since=last_ts)
@@ -215,15 +313,33 @@ async def _fetch_trades_loop(
             raise
         except Exception as exc:
             stats.errors += 1
+            if _is_permanent_error(exc):
+                log.info(
+                    "fetch_trades permanently disabled for symbol",
+                    exchange=handle.exchange_id,
+                    symbol=symbol,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return
+            sleep_for, backoff_idx = _next_backoff(backoff_idx)
+            # REST loops already waited ``poll_interval`` between successful
+            # iterations, so on errors we overlay the transient backoff on top
+            # of that base interval.
+            sleep_for = max(sleep_for, poll_interval * 2)
             log.warning(
                 "fetch_trades error",
                 exchange=handle.exchange_id,
                 symbol=symbol,
                 error=str(exc),
+                retry_in_s=sleep_for,
             )
-            await asyncio.sleep(poll_interval * 2)
-            continue
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+                return
+            except TimeoutError:
+                continue
         local_recv_ns = time.time_ns()
+        backoff_idx = 0
         for raw in trades:
             tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
