@@ -11,12 +11,14 @@ from __future__ import annotations
 import pytest
 
 from lead_lag_scanner.collector import (
+    _MAX_CONSECUTIVE_FAILURES,
     _RATE_LIMIT_BACKOFF_SECONDS,
     _RATE_LIMIT_JITTER_FRACTION,
     _TRANSIENT_BACKOFF_SECONDS,
     _is_permanent_error,
     _is_rate_limit_error,
     _next_backoff,
+    _normalise_error_text,
 )
 
 # ---------------------------------------------------------------------------
@@ -27,8 +29,13 @@ from lead_lag_scanner.collector import (
 @pytest.mark.parametrize(
     "message",
     [
-        # luno: ws watchTrades requires authenticated apiKey
+        # luno: ws watchTrades requires authenticated apiKey (no quotes)
         "luno watchTrades() requires apiKey credentials",
+        # luno: actual production ccxt string with double-quoted apiKey —
+        # caught by the quote-stripped match path.
+        'luno requires "apiKey" credential',
+        # ccxt variant with backticks (some older releases)
+        "luno requires `apiKey` credential",
         # cex.io: one ws subscription per process
         "cex one symbol per instance",
         # mexc: protobuf-frame switch ccxt has not implemented
@@ -46,6 +53,9 @@ from lead_lag_scanner.collector import (
         "some-cex Access Denied",
         # Akamai reference URL on its own
         "errors.edgesuite.net 18.53071002 reference",
+        # weex: invalid contract / INVALID_ARGUMENT for an unsupported symbol
+        'weex {"result":false,"id":278,"msg":"INVALID_ARGUMENT: invalid contract"}',
+        "weex INVALID_ARGUMENT: invalid contract for SOL/USDT",
     ],
 )
 def test_permanent_error_matches(message: str) -> None:
@@ -83,6 +93,22 @@ def test_permanent_error_rejects(message: str) -> None:
         "RateLimitExceeded: throttled",
         # exchange that uses 'rate limit' phrasing
         "some-cex rate limit exceeded for endpoint /api/trades",
+        # bitget — application-level 30006 rate-limit code
+        'bitget {"event":"error","code":30006,"msg":"request too many"}',
+        # bitmart — 90006 (total topic quantity exceeds limit)
+        (
+            'bitmart {"errorMessage":"Subscribed total topic quantity exceeds limit",'
+            '"errorCode":"90006","event":"subscribe"}'
+        ),
+        # bitmart — 90007 (frequency exceeds limit)
+        (
+            'bitmart {"errorMessage":"Subscribed message frequency exceeds limit, '
+            'please try later","errorCode":"90007","event":"..."}'
+        ),
+        # bigone — application-level 10429
+        'bigone {"code":10429,"message":"Too many requests"}',
+        # coinsph — application-level -1003
+        'coinsph {"code":-1003,"msg":"Too many requests; current request has limited."}',
     ],
 )
 def test_rate_limit_error_matches(message: str) -> None:
@@ -148,3 +174,65 @@ def test_next_backoff_rate_limit_floor_is_much_higher_than_transient() -> None:
     rate_limit_min = _RATE_LIMIT_BACKOFF_SECONDS[0] * (1.0 - _RATE_LIMIT_JITTER_FRACTION)
     transient_max = _TRANSIENT_BACKOFF_SECONDS[0]
     assert rate_limit_min >= transient_max * 4
+
+
+# ---------------------------------------------------------------------------
+# Quote-stripping match path (the luno fix)
+# ---------------------------------------------------------------------------
+
+
+def test_normalise_error_text_strips_quotes() -> None:
+    """``_normalise_error_text`` returns lowered + lowered-without-quotes."""
+
+    lowered, no_quotes = _normalise_error_text(RuntimeError('luno requires "apiKey" credential'))
+    assert lowered == 'luno requires "apikey" credential'
+    assert no_quotes == "luno requires apikey credential"
+
+
+def test_normalise_error_text_handles_backticks_and_singles() -> None:
+    lowered, no_quotes = _normalise_error_text(
+        RuntimeError("ws subscribe to one `symbol` per inst")
+    )
+    assert "`" in lowered
+    assert "`" not in no_quotes
+    # the canonical pattern matches the stripped form even though the
+    # raw form has backticks in the middle of the phrase.
+    assert "subscribe to one symbol" in no_quotes
+
+
+# ---------------------------------------------------------------------------
+# Consecutive-failure threshold
+# ---------------------------------------------------------------------------
+
+
+def test_max_consecutive_failures_is_small_enough_to_avoid_log_spam() -> None:
+    """Threshold should mute a stuck (exchange, symbol) pair within a small
+    constant number of WARN lines.
+
+    The user-facing guarantee: a permanently-broken pair like upbit's
+    keepalive cycle produces at most ``_MAX_CONSECUTIVE_FAILURES`` WARN
+    lines (one per retry) plus exactly one INFO line, regardless of how
+    long the run lasts. With 50 symbols on a stuck exchange that's
+    ``50 * (K + 1)`` lines total — flat in run duration.
+    """
+
+    assert 1 < _MAX_CONSECUTIVE_FAILURES <= 10
+
+
+def test_max_consecutive_failures_is_large_enough_to_ride_out_brief_blips() -> None:
+    """K + the transient schedule must give at least ~50s of patience.
+
+    A symbol whose exchange has a brief blip will see the loop retry
+    through the schedule and recover, resetting the counter to 0. The
+    transient schedule sums to ``1 + 5 + 15 + 30 = 51s`` for K=5
+    (the first four sleep intervals), enough to ride out a typical
+    DNS / TLS / TCP blip without silently muting exchanges.
+    """
+
+    # Sum of the first K-1 entries of the transient schedule (the time
+    # between error #1 and the K-th error, inclusive).
+    transient_total = 0.0
+    for i in range(_MAX_CONSECUTIVE_FAILURES - 1):
+        idx = min(i, len(_TRANSIENT_BACKOFF_SECONDS) - 1)
+        transient_total += _TRANSIENT_BACKOFF_SECONDS[idx]
+    assert transient_total >= 50.0

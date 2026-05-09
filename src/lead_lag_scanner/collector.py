@@ -137,22 +137,30 @@ class CollectionStats:
 _MAX_INGEST_DRIFT_MS: int = 3_600_000
 
 
-# Substrings (case-insensitive) that mark an error as *permanent* for a
-# given (exchange, symbol) pair. When we see one we log the failure once,
-# stop the loop, and never reschedule. Retrying these wastes CPU/network
-# and floods the log with identical traceback noise.
+# Substrings (case-insensitive, also matched against a quote-stripped copy
+# of the message) that mark an error as *permanent* for a given (exchange,
+# symbol) pair. When we see one we log the failure once, stop the loop, and
+# never reschedule. Retrying these wastes CPU/network and floods the log
+# with identical traceback noise.
 #
 # Examples:
-#   - "requires apiKey"         → e.g. luno's watch_trades demands auth
-#   - "requires `apiKey`"       → ccxt variant of the same message
+#   - "requires apikey"         → e.g. luno's watch_trades demands auth.
+#                                 Real ccxt string is `requires "apiKey"
+#                                 credential`; the quote-stripped match
+#                                 (see ``_is_permanent_error``) catches it
+#                                 without us needing per-quote variants.
 #   - "is not supported"        → exchange doesn't expose this method
-#   - "NotSupported"            → ccxt's NotSupported exception text
+#   - "notsupported"            → ccxt's NotSupported exception text
 #   - "one symbol per instance" → cex.io ws limitation
 #   - "protobuf"                → mexc switched ws frames to protobuf, ccxt
 #                                 has not implemented the parser
 #   - "403 forbidden" / "access denied" / "errors.edgesuite.net"
 #                               → Akamai/CDN geo-block at our IP (e.g. bigone).
 #                                 Will not recover by retrying.
+#   - "invalid_argument" / "invalid contract"
+#                               → e.g. weex returns this for symbols its ws
+#                                 stream doesn't recognise — pure config
+#                                 mismatch, no point retrying.
 _PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
     "requires apikey",
     "is not supported",
@@ -165,21 +173,51 @@ _PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
     "403 forbidden",
     "access denied",
     "errors.edgesuite.net",
+    "invalid_argument",
+    "invalid contract",
 )
 
 
-# Substrings (case-insensitive) that mark an error as a *rate limit* hit.
-# These are transient — the exchange will accept us again later — but the
-# normal 1s/5s/15s/30s backoff is too aggressive: hammering on a 429 just
-# extends the throttle window. We use a separate, longer schedule with
-# jitter to spread out the retry storms when many concurrent symbol
-# loops on the same exchange all hit 429 at once.
+# Substrings (case-insensitive, also matched against a quote-stripped copy
+# of the message) that mark an error as a *rate limit* hit. These are
+# transient — the exchange will accept us again later — but the normal
+# 1s/5s/15s/30s backoff is too aggressive: hammering on a 429 just extends
+# the throttle window. We use a separate, longer schedule with jitter to
+# spread out the retry storms when many concurrent symbol loops on the
+# same exchange all hit 429 at once.
 _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "too many requests",
     "rate limit",
     '"code":429',
     "ratelimitexceeded",
+    # bitget — uses a 30006 application-level code in addition to HTTP 429
+    "request too many",
+    '"code":30006',
+    # bitmart — error codes for "subscribed message frequency" /
+    # "subscribed total topic quantity" exceeding limits. Both clear after
+    # a backoff window.
+    '"errorcode":"90006"',
+    '"errorcode":"90007"',
+    "frequency exceeds limit",
+    "topic quantity exceeds limit",
+    # bigone application-level rate-limit code
+    '"code":10429',
+    # coinsph application-level rate-limit code
+    '"code":-1003',
 )
+
+
+# Per-(exchange, symbol) "no progress" threshold. After this many
+# *consecutive* errors with no successful trade batch in between we give up
+# on the symbol forever. This handles the long-tail spam patterns that
+# don't fit a single substring rule (upbit closing every ws on code 1000
+# and 1006, kucoin's "Cannot write to closing transport", whitebit ws
+# closures, mexc ping-pong timeouts) without needing exchange-specific
+# heuristics. ``5`` chosen so a brief network blip (which would resolve in
+# 1-2 retries) is forgiven, but a permanently-broken (exchange, symbol)
+# pair is muted within ~80s for transient errors / ~13min for rate-limit
+# errors. The counter resets to zero on every successful iteration.
+_MAX_CONSECUTIVE_FAILURES: int = 5
 
 
 # Exponential backoff schedule (seconds) for transient errors in the watch /
@@ -199,24 +237,41 @@ _RATE_LIMIT_BACKOFF_SECONDS: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
 _RATE_LIMIT_JITTER_FRACTION: float = 0.5
 
 
-def _is_permanent_error(exc: BaseException) -> bool:
-    """Return ``True`` when ``exc`` matches a known unrecoverable pattern.
+_QUOTE_CHARS = "\"'`"
 
-    The match is intentionally loose (case-insensitive substring) because
-    different ccxt versions wrap the same underlying problem in slightly
-    different error strings, and we'd rather skip a borderline case than
-    spin on a hopeless retry forever.
+
+def _normalise_error_text(exc: BaseException) -> tuple[str, str]:
+    """Return ``(lower, lower_no_quotes)`` for substring matching.
+
+    We match patterns against both the raw lowercased message and a copy
+    with single/double/back quotes removed so that ccxt-style strings like
+    ``requires "apiKey" credential`` match the canonical
+    ``requires apikey`` pattern without needing per-quote variants.
     """
 
     lowered = str(exc).lower()
-    return any(pattern in lowered for pattern in _PERMANENT_ERROR_PATTERNS)
+    no_quotes = lowered.translate(str.maketrans("", "", _QUOTE_CHARS))
+    return lowered, no_quotes
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """Return ``True`` when ``exc`` matches a known unrecoverable pattern.
+
+    The match is intentionally loose (case-insensitive substring, with
+    quotes stripped) because different ccxt versions wrap the same
+    underlying problem in slightly different error strings, and we'd
+    rather skip a borderline case than spin on a hopeless retry forever.
+    """
+
+    lowered, no_quotes = _normalise_error_text(exc)
+    return any(pattern in lowered or pattern in no_quotes for pattern in _PERMANENT_ERROR_PATTERNS)
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
     """Return ``True`` when ``exc`` looks like a transient 429 / rate-limit hit."""
 
-    lowered = str(exc).lower()
-    return any(pattern in lowered for pattern in _RATE_LIMIT_PATTERNS)
+    lowered, no_quotes = _normalise_error_text(exc)
+    return any(pattern in lowered or pattern in no_quotes for pattern in _RATE_LIMIT_PATTERNS)
 
 
 def _next_backoff(current_index: int, *, rate_limited: bool = False) -> tuple[float, int]:
@@ -286,6 +341,7 @@ async def _watch_trades_loop(
     client = handle.client
     seen: set[str] = set()
     backoff_idx = 0
+    consecutive_failures = 0
     while not stop_event.is_set():
         try:
             trades: list[dict[str, Any]] = await client.watch_trades(symbol)
@@ -293,6 +349,7 @@ async def _watch_trades_loop(
             raise
         except Exception as exc:
             stats.errors += 1
+            consecutive_failures += 1
             if _is_permanent_error(exc):
                 # Log once at INFO and stop forever — there is no value in
                 # retrying a NotSupported / apiKey-required / protobuf-frame
@@ -304,6 +361,21 @@ async def _watch_trades_loop(
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 return
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                # Give up on this (exchange, symbol) pair: we've burned the
+                # full backoff schedule without ever seeing a successful
+                # batch, so further retries would just add log noise.
+                # Catches upbit's 1000-on-keepalive cycle, kucoin's
+                # "Cannot write to closing transport", whitebit ws closures,
+                # and mexc ping-pong timeouts without per-exchange knowledge.
+                log.info(
+                    "watch_trades disabled after consecutive failures",
+                    exchange=handle.exchange_id,
+                    symbol=symbol,
+                    consecutive=consecutive_failures,
+                    last_error=str(exc),
+                )
+                return
             rate_limited = _is_rate_limit_error(exc)
             sleep_for, backoff_idx = _next_backoff(backoff_idx, rate_limited=rate_limited)
             log.warning(
@@ -313,6 +385,7 @@ async def _watch_trades_loop(
                 error=str(exc),
                 retry_in_s=round(sleep_for, 1),
                 rate_limited=rate_limited,
+                consecutive=consecutive_failures,
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
@@ -324,9 +397,11 @@ async def _watch_trades_loop(
         # ``local_recv_ts_ns`` and clock-skew calibration is not biased by
         # how the analyzer iterates the batch.
         local_recv_ns = time.time_ns()
-        # Successful iteration: reset the transient backoff schedule so a
-        # one-off blip earlier in the run doesn't keep us in slow mode.
+        # Successful iteration: reset the transient backoff schedule and the
+        # consecutive-failure counter so a one-off blip earlier in the run
+        # doesn't keep us in slow mode (or one error away from being muted).
         backoff_idx = 0
+        consecutive_failures = 0
         for raw in trades:
             tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
@@ -358,6 +433,7 @@ async def _fetch_trades_loop(
     # exchanges (e.g. Kraken) that default to the first-ever trade.
     last_ts: int = int(time.time() * 1000) - 5_000
     backoff_idx = 0
+    consecutive_failures = 0
     while not stop_event.is_set():
         try:
             trades: list[dict[str, Any]] = await client.fetch_trades(symbol, since=last_ts)
@@ -365,12 +441,22 @@ async def _fetch_trades_loop(
             raise
         except Exception as exc:
             stats.errors += 1
+            consecutive_failures += 1
             if _is_permanent_error(exc):
                 log.info(
                     "fetch_trades permanently disabled for symbol",
                     exchange=handle.exchange_id,
                     symbol=symbol,
                     error=f"{type(exc).__name__}: {exc}",
+                )
+                return
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                log.info(
+                    "fetch_trades disabled after consecutive failures",
+                    exchange=handle.exchange_id,
+                    symbol=symbol,
+                    consecutive=consecutive_failures,
+                    last_error=str(exc),
                 )
                 return
             rate_limited = _is_rate_limit_error(exc)
@@ -389,6 +475,7 @@ async def _fetch_trades_loop(
                 error=str(exc),
                 retry_in_s=round(sleep_for, 1),
                 rate_limited=rate_limited,
+                consecutive=consecutive_failures,
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
@@ -397,6 +484,7 @@ async def _fetch_trades_loop(
                 continue
         local_recv_ns = time.time_ns()
         backoff_idx = 0
+        consecutive_failures = 0
         for raw in trades:
             tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
