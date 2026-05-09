@@ -27,6 +27,70 @@ from .storage import Trade, TradeWriter
 log = structlog.get_logger(__name__)
 
 
+_QUIET_HANDLER_INSTALLED = "_lead_lag_quiet_handler_installed"
+
+# Substrings of asyncio default-handler messages we want to suppress entirely.
+# These all describe transient ws/REST churn that the outer retry loop already
+# handles; printing them as multi-line tracebacks per occurrence floods the
+# terminal under high churn (a single 1006 close on 51 exchanges x 200 symbols
+# can produce thousands of lines in a few seconds).
+_SUPPRESSED_LOOP_MESSAGES: tuple[str, ...] = (
+    "Future exception was never retrieved",
+    "Task exception was never retrieved",
+)
+
+# Module prefixes whose unhandled errors are dropped silently. ccxt errors
+# bubble up through asyncio when ccxt.pro spawns inner subscription tasks
+# whose results we never directly await; the outer watch_trades retry loop in
+# this file already logs and recovers from them, so re-printing is pure noise.
+_SUPPRESSED_EXC_MODULES: tuple[str, ...] = ("ccxt.",)
+
+
+def install_quiet_loop_handler(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Replace the running loop's default exception handler with a quieter one.
+
+    The default ``asyncio`` handler prints a full traceback for every
+    Future/Task whose exception is never retrieved. ``ccxt.pro`` schedules
+    short-lived inner tasks for ws subscriptions whose lifetime we do not
+    directly own, so a routine ws disconnect (NetworkError 1006/1000) or a
+    schema mismatch on a single symbol (BadRequest from one exchange) ends up
+    surfacing here even though our outer retry loop already handled it.
+
+    The replacement handler:
+      * silently drops messages matching :data:`_SUPPRESSED_LOOP_MESSAGES`,
+      * silently drops exceptions raised from modules in
+        :data:`_SUPPRESSED_EXC_MODULES`,
+      * forwards everything else to the default handler so genuine bugs
+        (TypeError, KeyError, etc.) still surface.
+
+    Idempotent: calling it twice on the same loop is a no-op.
+    """
+
+    target = loop or asyncio.get_running_loop()
+    if getattr(target, _QUIET_HANDLER_INSTALLED, False):
+        return
+
+    def _handler(loop_obj: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        msg = str(context.get("message", ""))
+        exc = context.get("exception")
+        # Only suppress when BOTH the message matches the noisy pattern AND
+        # the exception originates in ccxt — that combination is exclusively
+        # ws/REST churn we already retry on. Anything else (including a
+        # matching message without an exception, which would be unusual)
+        # falls through to the default handler so it stays visible.
+        if (
+            exc is not None
+            and any(token in msg for token in _SUPPRESSED_LOOP_MESSAGES)
+            and any(type(exc).__module__.startswith(p) for p in _SUPPRESSED_EXC_MODULES)
+        ):
+            return
+        loop_obj.default_exception_handler(context)
+
+    target.set_exception_handler(_handler)
+    # Mark via attribute so tests / repeated installs are idempotent.
+    target.__dict__[_QUIET_HANDLER_INSTALLED] = True  # type: ignore[attr-defined]
+
+
 @dataclass(slots=True)
 class CollectionStats:
     trades_received: int = 0
@@ -294,6 +358,7 @@ async def collect(config: Config) -> CollectionStats:
     """
 
     config.storage.data_dir.mkdir(parents=True, exist_ok=True)
+    install_quiet_loop_handler()
     writer = TradeWriter(data_dir=config.storage.data_dir)
     stats = CollectionStats()
     stop_event = asyncio.Event()
