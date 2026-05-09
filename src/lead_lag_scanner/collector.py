@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -149,6 +150,9 @@ _MAX_INGEST_DRIFT_MS: int = 3_600_000
 #   - "one symbol per instance" → cex.io ws limitation
 #   - "protobuf"                → mexc switched ws frames to protobuf, ccxt
 #                                 has not implemented the parser
+#   - "403 forbidden" / "access denied" / "errors.edgesuite.net"
+#                               → Akamai/CDN geo-block at our IP (e.g. bigone).
+#                                 Will not recover by retrying.
 _PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
     "requires apikey",
     "is not supported",
@@ -158,6 +162,23 @@ _PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
     "no such market",
     "market is not active",
     "subscribe to one symbol",
+    "403 forbidden",
+    "access denied",
+    "errors.edgesuite.net",
+)
+
+
+# Substrings (case-insensitive) that mark an error as a *rate limit* hit.
+# These are transient — the exchange will accept us again later — but the
+# normal 1s/5s/15s/30s backoff is too aggressive: hammering on a 429 just
+# extends the throttle window. We use a separate, longer schedule with
+# jitter to spread out the retry storms when many concurrent symbol
+# loops on the same exchange all hit 429 at once.
+_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
+    "too many requests",
+    "rate limit",
+    '"code":429',
+    "ratelimitexceeded",
 )
 
 
@@ -166,6 +187,16 @@ _PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
 # successful iteration the backoff resets to the start of the schedule so a
 # brief blip doesn't penalise an exchange that recovered.
 _TRANSIENT_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 5.0, 15.0, 30.0)
+
+
+# Backoff schedule (seconds, base) when the underlying error looks like a
+# 429 / rate-limit. We start at 30s and stretch to 5 minutes; jitter is
+# added on top so concurrent loops don't sync back into the next throttle
+# window together. The values were chosen empirically to keep total log
+# volume manageable when 28 symbols on the same exchange all hit 429
+# simultaneously (typical cex/free tiers).
+_RATE_LIMIT_BACKOFF_SECONDS: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
+_RATE_LIMIT_JITTER_FRACTION: float = 0.5
 
 
 def _is_permanent_error(exc: BaseException) -> bool:
@@ -181,11 +212,30 @@ def _is_permanent_error(exc: BaseException) -> bool:
     return any(pattern in lowered for pattern in _PERMANENT_ERROR_PATTERNS)
 
 
-def _next_backoff(current_index: int) -> tuple[float, int]:
-    """Return ``(sleep_seconds, next_index)`` for the transient retry schedule."""
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Return ``True`` when ``exc`` looks like a transient 429 / rate-limit hit."""
 
-    idx = min(current_index, len(_TRANSIENT_BACKOFF_SECONDS) - 1)
-    return _TRANSIENT_BACKOFF_SECONDS[idx], idx + 1
+    lowered = str(exc).lower()
+    return any(pattern in lowered for pattern in _RATE_LIMIT_PATTERNS)
+
+
+def _next_backoff(current_index: int, *, rate_limited: bool = False) -> tuple[float, int]:
+    """Return ``(sleep_seconds, next_index)`` for the appropriate retry schedule.
+
+    When ``rate_limited`` is ``True`` we draw from the longer 429-aware
+    schedule and add up to ``±_RATE_LIMIT_JITTER_FRACTION`` of multiplicative
+    jitter so concurrent loops don't all retry at the same instant.
+    """
+
+    schedule = _RATE_LIMIT_BACKOFF_SECONDS if rate_limited else _TRANSIENT_BACKOFF_SECONDS
+    idx = min(current_index, len(schedule) - 1)
+    base = schedule[idx]
+    if rate_limited:
+        # Multiplicative jitter in [1 - f, 1 + f]. ``random.random()`` is
+        # fine here — these sleeps are not security-sensitive.
+        jitter = 1.0 + (random.random() * 2.0 - 1.0) * _RATE_LIMIT_JITTER_FRACTION
+        base *= jitter
+    return base, idx + 1
 
 
 def _normalise_trade(
@@ -254,13 +304,15 @@ async def _watch_trades_loop(
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 return
-            sleep_for, backoff_idx = _next_backoff(backoff_idx)
+            rate_limited = _is_rate_limit_error(exc)
+            sleep_for, backoff_idx = _next_backoff(backoff_idx, rate_limited=rate_limited)
             log.warning(
                 "watch_trades error",
                 exchange=handle.exchange_id,
                 symbol=symbol,
                 error=str(exc),
-                retry_in_s=sleep_for,
+                retry_in_s=round(sleep_for, 1),
+                rate_limited=rate_limited,
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
@@ -321,17 +373,22 @@ async def _fetch_trades_loop(
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 return
-            sleep_for, backoff_idx = _next_backoff(backoff_idx)
+            rate_limited = _is_rate_limit_error(exc)
+            sleep_for, backoff_idx = _next_backoff(backoff_idx, rate_limited=rate_limited)
             # REST loops already waited ``poll_interval`` between successful
-            # iterations, so on errors we overlay the transient backoff on top
-            # of that base interval.
-            sleep_for = max(sleep_for, poll_interval * 2)
+            # iterations, so on non-rate-limit errors we overlay the transient
+            # backoff on top of that base interval. For rate-limit errors we
+            # use the schedule as-is — it's already much longer than 2x the
+            # poll interval and we don't want to inflate it further.
+            if not rate_limited:
+                sleep_for = max(sleep_for, poll_interval * 2)
             log.warning(
                 "fetch_trades error",
                 exchange=handle.exchange_id,
                 symbol=symbol,
                 error=str(exc),
-                retry_in_s=sleep_for,
+                retry_in_s=round(sleep_for, 1),
+                rate_limited=rate_limited,
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
