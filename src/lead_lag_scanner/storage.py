@@ -242,6 +242,65 @@ def build_duckdb_view(data_dir: Path, duckdb_path: Path) -> None:
         )
 
 
+# Match a parquet path embedded in a DuckDB error message. Two real-world
+# variants we have to support:
+#
+#   "No magic bytes found at end of file 'data/trades/gate/2026-05-09.parquet'"
+#   "Invalid Input Error: File '/abs/path/x.parquet' too small to be a Parquet file"
+#
+# Case-insensitive on the leading word so both forms match. We capture up to
+# ``.parquet`` so paths containing other characters are still extracted
+# correctly. Used by :func:`load_trades` to identify and quarantine the
+# offending shard.
+_CORRUPT_PATH_RE = re.compile(r"\bfile ['\"]([^'\"]+\.parquet)['\"]", re.IGNORECASE)
+
+
+def _quarantine_shard(path: Path) -> bool:
+    """Rename a corrupt parquet shard to ``<name>.parquet.corrupt``.
+
+    Returns ``True`` on success, ``False`` if the source path no longer
+    exists (e.g. a concurrent writer rotated it) or the rename fails. We
+    keep the file on disk under a different extension so the user can
+    inspect or recover it manually; the read-side glob (``*.parquet``)
+    will simply skip it.
+    """
+
+    target = path.with_suffix(path.suffix + ".corrupt")
+    try:
+        os.replace(path, target)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("could not quarantine corrupt shard %s: %s", path, exc)
+        return False
+    log.warning("quarantined corrupt shard %s -> %s", path, target)
+    return True
+
+
+def _quarantine_corrupt_shard_from_error(data_dir: Path, exc: BaseException) -> bool:
+    """Parse a DuckDB error message and quarantine the offending parquet.
+
+    Returns ``True`` when a shard was successfully renamed (so the caller
+    knows it's worth retrying the query), ``False`` otherwise.
+    """
+
+    match = _CORRUPT_PATH_RE.search(str(exc))
+    if match is None:
+        return False
+    raw = match.group(1)
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = (data_dir / raw).resolve() if (data_dir / raw).exists() else candidate
+    if not candidate.exists():
+        # Try the raw path as a relative path from the current working dir.
+        cwd_candidate = Path.cwd() / raw
+        if cwd_candidate.exists():
+            candidate = cwd_candidate
+        else:
+            return False
+    return _quarantine_shard(candidate)
+
+
 def load_trades(
     data_dir: Path,
     *,
@@ -255,25 +314,57 @@ def load_trades(
     loaded with zeros via DuckDB's ``union_by_name=true``; missing columns
     are backfilled to 0 / "" so the returned frame always has the canonical
     schema.
+
+    If a parquet shard has a corrupt footer (e.g. a legacy
+    ``<YYYY-MM-DD>.parquet`` written in-place by a previous version of the
+    code that was interrupted mid-write), the read fails with
+    ``InvalidInputException``. We catch the error, parse the offending
+    path out of the message, rename the file to ``<name>.parquet.corrupt``
+    so the read-side glob skips it, and retry the query once. On a second
+    failure we surface the original exception's text as part of the empty
+    return path so callers (e.g. the web dashboard) can show an
+    actionable message.
     """
 
     glob = parquet_glob(data_dir)
-    try:
-        with duckdb.connect() as con:
-            query = f"SELECT * FROM read_parquet('{glob}', hive_partitioning=0, union_by_name=true)"
-            params: list[str] = []
-            filters: list[str] = []
-            if exchange is not None:
-                filters.append("exchange = ?")
-                params.append(exchange)
-            if symbol is not None:
-                filters.append("symbol = ?")
-                params.append(symbol)
-            if filters:
-                query += " WHERE " + " AND ".join(filters)
-            df = con.execute(query, params).df()
-    except duckdb.IOException:
-        return pd.DataFrame(columns=list(TRADE_COLUMNS))
+    query, params = _build_load_query(glob, exchange=exchange, symbol=symbol)
+    # Up to ``len(corrupt_files) + 1`` attempts: each iteration may quarantine
+    # a single bad shard and retry. We bound this with a small constant so a
+    # pathological data dir can't trap us in a loop.
+    for _attempt in range(8):
+        try:
+            with duckdb.connect() as con:
+                return _post_process_frame(con.execute(query, params).df())
+        except (duckdb.IOException, duckdb.InvalidInputException) as exc:
+            if _quarantine_corrupt_shard_from_error(data_dir, exc):
+                continue
+            log.warning("load_trades failed; could not identify shard: %s", exc)
+            return pd.DataFrame(columns=list(TRADE_COLUMNS))
+    log.warning("load_trades: gave up after repeatedly quarantining shards")
+    return pd.DataFrame(columns=list(TRADE_COLUMNS))
+
+
+def _build_load_query(
+    glob: str,
+    *,
+    exchange: str | None,
+    symbol: str | None,
+) -> tuple[str, list[str]]:
+    query = f"SELECT * FROM read_parquet('{glob}', hive_partitioning=0, union_by_name=true)"
+    params: list[str] = []
+    filters: list[str] = []
+    if exchange is not None:
+        filters.append("exchange = ?")
+        params.append(exchange)
+    if symbol is not None:
+        filters.append("symbol = ?")
+        params.append(symbol)
+    if filters:
+        query += " WHERE " + " AND ".join(filters)
+    return query, params
+
+
+def _post_process_frame(df: pd.DataFrame) -> pd.DataFrame:
 
     if df.empty:
         return pd.DataFrame(columns=list(TRADE_COLUMNS))
