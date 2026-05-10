@@ -315,33 +315,145 @@ def load_trades(
     are backfilled to 0 / "" so the returned frame always has the canonical
     schema.
 
-    If a parquet shard has a corrupt footer (e.g. a legacy
-    ``<YYYY-MM-DD>.parquet`` written in-place by a previous version of the
-    code that was interrupted mid-write), the read fails with
-    ``InvalidInputException``. We catch the error, parse the offending
-    path out of the message, rename the file to ``<name>.parquet.corrupt``
-    so the read-side glob skips it, and retry the query once. On a second
-    failure we surface the original exception's text as part of the empty
-    return path so callers (e.g. the web dashboard) can show an
-    actionable message.
+    The function is layered so the dashboard always gets *something*
+    actionable instead of crashing on a single bad shard:
+
+    1. **Fast path** — DuckDB's ``read_parquet`` glob, materialised via
+       ``.df()``. This is the common case and handles 99 % of reads.
+    2. **Quarantine retry** — if DuckDB raises ``IOException`` or
+       ``InvalidInputException`` (e.g. a legacy ``<YYYY-MM-DD>.parquet``
+       file with a corrupt footer because the old in-place writer was
+       killed mid-flush), we parse the offending path out of the error
+       message, rename the file to ``<name>.parquet.corrupt`` (so the
+       glob skips it), and retry the query.  Up to ``_MAX_LOAD_ATTEMPTS``
+       iterations to handle multiple bad shards.
+    3. **Per-shard pyarrow fallback** — for any other DuckDB error
+       (``NotImplementedException`` from a newer pandas/duckdb pair that
+       can't map a column type, ``ConversionException`` from a logical
+       type that doesn't fit numpy, etc.) we fall back to reading each
+       shard individually with ``pyarrow.parquet.read_table``,
+       quarantining shards that pyarrow itself can't read, promoting the
+       rest to :data:`TRADE_SCHEMA`, concatenating, and converting via
+       ``pa.Table.to_pandas`` (a more permissive code path than
+       DuckDB's numpy converter).
     """
 
     glob = parquet_glob(data_dir)
     query, params = _build_load_query(glob, exchange=exchange, symbol=symbol)
-    # Up to ``len(corrupt_files) + 1`` attempts: each iteration may quarantine
-    # a single bad shard and retry. We bound this with a small constant so a
-    # pathological data dir can't trap us in a loop.
-    for _attempt in range(8):
+    # Each iteration may quarantine a single bad shard and retry; bounded
+    # with a small constant so a pathological data dir can't trap us.
+    for _attempt in range(_MAX_LOAD_ATTEMPTS):
         try:
             with duckdb.connect() as con:
                 return _post_process_frame(con.execute(query, params).df())
         except (duckdb.IOException, duckdb.InvalidInputException) as exc:
             if _quarantine_corrupt_shard_from_error(data_dir, exc):
                 continue
-            log.warning("load_trades failed; could not identify shard: %s", exc)
-            return pd.DataFrame(columns=list(TRADE_COLUMNS))
-    log.warning("load_trades: gave up after repeatedly quarantining shards")
-    return pd.DataFrame(columns=list(TRADE_COLUMNS))
+            log.warning(
+                "load_trades: corrupt shard not identifiable from error; falling back to pyarrow: %s",
+                exc,
+            )
+            return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
+        except duckdb.Error as exc:
+            log.warning(
+                "load_trades: duckdb path failed (%s); falling back to pyarrow: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
+    log.warning(
+        "load_trades: gave up after %d quarantine retries; falling back to pyarrow",
+        _MAX_LOAD_ATTEMPTS,
+    )
+    return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
+
+
+_MAX_LOAD_ATTEMPTS = 8
+
+
+def _load_trades_via_pyarrow(
+    data_dir: Path,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+) -> pd.DataFrame:
+    """Per-shard fallback when the DuckDB glob path raises.
+
+    Reads every ``*.parquet`` under ``<data_dir>/trades/`` individually
+    via ``pyarrow.parquet.read_table``. Shards that pyarrow itself
+    cannot read (genuinely corrupt files) are quarantined to
+    ``<name>.parquet.corrupt`` so subsequent calls' fast path succeeds.
+    Surviving shards are promoted to :data:`TRADE_SCHEMA` (with the
+    same backfill rules as :func:`_read_shard_promoting`, plus
+    permissive type coercion that falls back to a default-valued
+    column when an existing column's dtype cannot be cast), concatenated,
+    optionally filtered, and converted to pandas via
+    ``pa.Table.to_pandas`` — a different code path from DuckDB's
+    ``.df()`` that handles a wider range of arrow types.
+    """
+
+    trades_dir = data_dir / "trades"
+    if not trades_dir.exists():
+        return pd.DataFrame(columns=list(TRADE_COLUMNS))
+
+    tables: list[pa.Table] = []
+    for shard in sorted(trades_dir.rglob("*.parquet")):
+        try:
+            t = pq.read_table(shard)
+        except (OSError, pa.ArrowException) as exc:
+            log.warning("pyarrow could not read shard %s: %s", shard, exc)
+            _quarantine_shard(shard)
+            continue
+        try:
+            tables.append(_promote_to_trade_schema(t))
+        except (pa.ArrowException, ValueError) as exc:
+            log.warning("pyarrow could not promote shard %s: %s", shard, exc)
+            _quarantine_shard(shard)
+
+    if not tables:
+        return pd.DataFrame(columns=list(TRADE_COLUMNS))
+
+    combined = pa.concat_tables(tables)
+    df = combined.to_pandas()
+    if exchange is not None:
+        df = df[df["exchange"] == exchange]
+    if symbol is not None:
+        df = df[df["symbol"] == symbol]
+    return _post_process_frame(df.reset_index(drop=True))
+
+
+def _promote_to_trade_schema(table: pa.Table) -> pa.Table:
+    """Coerce a parquet table to :data:`TRADE_SCHEMA`, permissively.
+
+    Missing columns are filled with type-appropriate defaults (0 / 0.0 / "");
+    columns with a different type are cast to the canonical type, falling
+    back to defaults if the cast itself raises (e.g. a string column where
+    we expect an int).
+    """
+
+    n = table.num_rows
+    columns: dict[str, pa.Array | pa.ChunkedArray] = {}
+    for f in TRADE_SCHEMA:
+        if f.name not in table.column_names:
+            columns[f.name] = _default_field_array(f, n)
+            continue
+        col = table.column(f.name)
+        if col.type == f.type:
+            columns[f.name] = col
+            continue
+        try:
+            columns[f.name] = col.cast(f.type)
+        except (pa.ArrowException, ValueError):
+            columns[f.name] = _default_field_array(f, n)
+    return pa.table(columns, schema=TRADE_SCHEMA)
+
+
+def _default_field_array(field: pa.Field, n: int) -> pa.Array:
+    if pa.types.is_integer(field.type):
+        return pa.array([0] * n, type=field.type)
+    if pa.types.is_floating(field.type):
+        return pa.array([0.0] * n, type=field.type)
+    return pa.array([""] * n, type=field.type)
 
 
 def _build_load_query(

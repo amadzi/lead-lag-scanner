@@ -5,11 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from lead_lag_scanner.storage import (
     _CORRUPT_PATH_RE,
     Trade,
     TradeWriter,
+    _load_trades_via_pyarrow,
+    _promote_to_trade_schema,
     _quarantine_corrupt_shard_from_error,
     build_duckdb_view,
     load_trades,
@@ -173,3 +177,105 @@ def test_load_trades_returns_empty_if_quarantine_fails(tmp_path: Path) -> None:
     # path) or load returned empty (older versions). Both are correct
     # behaviour — what matters is that we did not deadlock.
     assert df.empty
+
+
+# ---------------------------------------------------------------------------
+# Per-shard pyarrow fallback (kicks in when DuckDB cannot map a column type
+# to numpy/pandas — e.g. duckdb.NotImplementedException "don't know what
+# type" — which is *not* a "corrupt file" condition. The fallback reads each
+# parquet individually via pyarrow and converts via pa.Table.to_pandas.)
+# ---------------------------------------------------------------------------
+
+
+def test_promote_to_trade_schema_backfills_missing_columns() -> None:
+    """A legacy schema missing local_recv_ts_ns is filled with zeros."""
+
+    legacy = pa.table(
+        {
+            "timestamp_ms": pa.array([1, 2], type=pa.int64()),
+            "exchange": pa.array(["x", "y"], type=pa.string()),
+            "symbol": pa.array(["BTC", "ETH"], type=pa.string()),
+            "price": pa.array([100.0, 200.0], type=pa.float64()),
+            "amount": pa.array([0.1, 0.2], type=pa.float64()),
+            "side": pa.array(["buy", "sell"], type=pa.string()),
+            "trade_id": pa.array(["t1", "t2"], type=pa.string()),
+        }
+    )
+    promoted = _promote_to_trade_schema(legacy)
+    assert "local_recv_ts_ns" in promoted.column_names
+    assert promoted["local_recv_ts_ns"].to_pylist() == [0, 0]
+
+
+def test_promote_to_trade_schema_casts_int32_to_int64() -> None:
+    """A shard with timestamp_ms as int32 is cast to int64."""
+
+    weird = pa.table(
+        {
+            "timestamp_ms": pa.array([1, 2], type=pa.int32()),  # not int64
+            "exchange": pa.array(["x", "y"], type=pa.string()),
+            "symbol": pa.array(["BTC", "ETH"], type=pa.string()),
+            "price": pa.array([100.0, 200.0], type=pa.float64()),
+            "amount": pa.array([0.1, 0.2], type=pa.float64()),
+            "side": pa.array(["buy", "sell"], type=pa.string()),
+            "trade_id": pa.array(["t1", "t2"], type=pa.string()),
+            "local_recv_ts_ns": pa.array([10, 20], type=pa.int64()),
+        }
+    )
+    promoted = _promote_to_trade_schema(weird)
+    assert promoted.schema.field("timestamp_ms").type == pa.int64()
+    assert promoted["timestamp_ms"].to_pylist() == [1, 2]
+
+
+def test_load_trades_via_pyarrow_reads_real_shards(tmp_path: Path) -> None:
+    """The fallback path reads good shards and skips genuinely broken ones."""
+
+    writer = TradeWriter(data_dir=tmp_path, flush_every=10)
+    writer.append(_make_trade(1_700_000_000_000))
+    writer.append(_make_trade(1_700_000_001_000, exchange="okx"))
+    writer.close()
+
+    # Genuinely corrupt file pyarrow cannot read either — should be quarantined.
+    bad = tmp_path / "trades" / "kraken" / "2023-11-14.parquet"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_bytes(b"not parquet at all")
+
+    df = _load_trades_via_pyarrow(tmp_path)
+    assert len(df) == 2
+    assert set(df["exchange"].unique()) == {"binance", "okx"}
+    assert not bad.exists(), "pyarrow-unreadable shard should be quarantined"
+    assert (tmp_path / "trades" / "kraken" / "2023-11-14.parquet.corrupt").exists()
+
+
+def test_load_trades_via_pyarrow_filters_by_exchange(tmp_path: Path) -> None:
+    writer = TradeWriter(data_dir=tmp_path, flush_every=10)
+    writer.append(_make_trade(1_700_000_000_000, exchange="binance"))
+    writer.append(_make_trade(1_700_000_001_000, exchange="okx"))
+    writer.close()
+
+    df = _load_trades_via_pyarrow(tmp_path, exchange="okx")
+    assert len(df) == 1
+    assert df["exchange"].iloc[0] == "okx"
+
+
+def test_load_trades_via_pyarrow_handles_legacy_schema(tmp_path: Path) -> None:
+    """A legacy shard without local_recv_ts_ns is loaded with zero filled in."""
+
+    shard_dir = tmp_path / "trades" / "kucoin"
+    shard_dir.mkdir(parents=True)
+    legacy = pa.table(
+        {
+            "timestamp_ms": pa.array([1, 2], type=pa.int64()),
+            "exchange": pa.array(["kucoin", "kucoin"], type=pa.string()),
+            "symbol": pa.array(["BTC/USDT", "ETH/USDT"], type=pa.string()),
+            "price": pa.array([100.0, 200.0], type=pa.float64()),
+            "amount": pa.array([0.1, 0.2], type=pa.float64()),
+            "side": pa.array(["buy", "sell"], type=pa.string()),
+            "trade_id": pa.array(["t1", "t2"], type=pa.string()),
+        }
+    )
+    pq.write_table(legacy, shard_dir / "2023-11-14.parquet")
+
+    df = _load_trades_via_pyarrow(tmp_path)
+    assert len(df) == 2
+    assert "local_recv_ts_ns" in df.columns
+    assert df["local_recv_ts_ns"].tolist() == [0, 0]
