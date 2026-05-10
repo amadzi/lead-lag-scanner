@@ -48,6 +48,7 @@ the impact of each fix independently.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from itertools import combinations
 
@@ -55,6 +56,8 @@ import numpy as np
 import pandas as pd
 
 from .config import AnalyzerConfig, BootstrapConfig, LagGrid
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,16 +595,33 @@ def analyze_all_with_diagnostics(
     for _symbol, by_exchange in by_symbol.items():
         exchanges = sorted(by_exchange.keys())
         for ex_a, ex_b in combinations(exchanges, 2):
-            result = analyze_pair(
-                _symbol,
-                ex_a,
-                ex_b,
-                by_exchange[ex_a],
-                by_exchange[ex_b],
-                config,
-                offsets=offsets,
-                rng=rng,
-            )
+            try:
+                result = analyze_pair(
+                    _symbol,
+                    ex_a,
+                    ex_b,
+                    by_exchange[ex_a],
+                    by_exchange[ex_b],
+                    config,
+                    offsets=offsets,
+                    rng=rng,
+                )
+            except (ValueError, ArithmeticError, IndexError, TypeError):
+                # Defensive: a single pathological pair (e.g. a numpy
+                # broadcast mismatch from a freshly-collected shard with
+                # an off-by-one mask) must not kill the entire dashboard
+                # refresh. Log with traceback and continue. The empty
+                # results list is still useful: the dashboard surfaces
+                # ``n_trades`` and the diagnostics so the user can tell
+                # collection is alive even when the analyzer chokes on
+                # one (symbol, exchange-pair).
+                log.exception(
+                    "analyze_pair failed for symbol=%s a=%s b=%s",
+                    _symbol,
+                    ex_a,
+                    ex_b,
+                )
+                continue
             if result is not None:
                 results.append(result)
     return AnalysisOutput(results=results, diagnostics=diagnostics)

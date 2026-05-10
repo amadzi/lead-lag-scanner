@@ -406,3 +406,54 @@ def test_analyze_all_handles_empty() -> None:
     cfg = _config_for_test()
     results = analyze_all(pd.DataFrame(), cfg)
     assert results == []
+
+
+def test_analyze_all_skips_pair_that_raises_unexpected_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single pathological (symbol, exchange-pair) must not kill the whole run.
+
+    The user reported a ``analyze: operands could not be broadcast together
+    with shapes (0,) (3,)`` error in the dashboard. The original
+    ``analyze_all_with_diagnostics`` did not have a per-pair try/except so
+    one such failure took down every other pair too. We now skip the bad
+    pair and continue. This test forces ``analyze_pair`` to raise on the
+    first invocation (mimicking the actual error wording the user saw)
+    and asserts that the second pair still produces a result.
+    """
+
+    df_btc = _synthetic_trades(
+        n_seconds=600,
+        leader_exchange="binance",
+        follower_exchange="okx",
+        symbol="BTC/USDT",
+        lag_seconds=2,
+    )
+    df_eth = _synthetic_trades(
+        n_seconds=600,
+        leader_exchange="binance",
+        follower_exchange="okx",
+        symbol="ETH/USDT",
+        lag_seconds=2,
+        seed=99,
+    )
+    trades = pd.concat([df_btc, df_eth], ignore_index=True)
+    config = _config_for_test()
+
+    real_pair = analyze_pair
+    call_count = {"n": 0}
+
+    def flaky_pair(*args: object, **kwargs: object) -> LeadLagResult | None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Mimic numpy's actual error wording so future searches still
+            # match this test if the dashboard surfaces a similar one.
+            raise ValueError("operands could not be broadcast together with shapes (0,) (3,) ")
+        return cast(LeadLagResult | None, real_pair(*args, **kwargs))  # type: ignore[arg-type]
+
+    monkeypatch.setattr("lead_lag_scanner.analyzer.analyze_pair", flaky_pair)
+
+    out = analyze_all_with_diagnostics(trades, config)
+    assert call_count["n"] == 2
+    assert len(out.results) == 1
+    assert out.results[0].symbol in {"BTC/USDT", "ETH/USDT"}

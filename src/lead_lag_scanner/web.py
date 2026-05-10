@@ -107,7 +107,11 @@ def _refresh_snapshot(state: WebState) -> _Snapshot:
     try:
         trades = load_trades(config.storage.data_dir)
     except Exception as exc:
-        log.warning("web: load_trades failed", error=str(exc))
+        # ``exc_info=True`` so structlog prints the full traceback, not
+        # just the message — invaluable when the error is something like
+        # ``operands could not be broadcast together`` that is meaningful
+        # only with line numbers.
+        log.warning("web: load_trades failed", error=str(exc), exc_info=True)
         return _Snapshot(last_error=f"load_trades: {exc!s}")
     if trades.empty:
         return _Snapshot(last_error=None)
@@ -115,7 +119,7 @@ def _refresh_snapshot(state: WebState) -> _Snapshot:
     try:
         out = analyze_all_with_diagnostics(trades, eff_analyzer)
     except Exception as exc:
-        log.warning("web: analyze_all failed", error=str(exc))
+        log.warning("web: analyze_all failed", error=str(exc), exc_info=True)
         return _Snapshot(
             n_trades=len(trades),
             exchanges_with_trades=tuple(sorted(trades["exchange"].unique().tolist())),
