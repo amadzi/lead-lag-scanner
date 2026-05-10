@@ -181,6 +181,9 @@ def _mk_pair(
     leader: str = "okx",
     follower: str = "gate",
     edge: float = 5.0,
+    net_edge: float | None = None,
+    tradeability: float | None = None,
+    flags: tuple[str, ...] = (),
     corr: float = 0.5,
     n: int = 200,
     lag: float = 1.0,
@@ -199,6 +202,10 @@ def _mk_pair(
         lag_ci_high_seconds=1.5,
         follower_return_std=0.001,
         edge_bps=edge,
+        gross_edge_bps=max(edge, 0.0),
+        net_edge_bps=edge - 6.0 if net_edge is None else net_edge,
+        tradeability=edge if tradeability is None else tradeability,
+        flags=list(flags),
         n_obs=n,
         n_co_active=n,
         active_rate_a=0.9,
@@ -261,6 +268,56 @@ def test_sort_pairs_unknown_falls_back_to_edge() -> None:
     p2 = _mk_pair(edge=10.0)
     out = _sort_pairs([p1, p2], "nonsense")
     assert out[0].edge_bps == 10.0
+
+
+def test_sort_pairs_tradeability_desc() -> None:
+    p1 = _mk_pair(symbol="A/USDT", tradeability=10.0)
+    p2 = _mk_pair(symbol="B/USDT", tradeability=100.0)
+    p3 = _mk_pair(symbol="C/USDT", tradeability=-5.0)
+    out = _sort_pairs([p1, p2, p3], "tradeability")
+    assert [p.symbol for p in out] == ["B/USDT", "A/USDT", "C/USDT"]
+
+
+def test_sort_pairs_net_edge_desc() -> None:
+    p1 = _mk_pair(symbol="A/USDT", net_edge=-3.0)
+    p2 = _mk_pair(symbol="B/USDT", net_edge=12.0)
+    p3 = _mk_pair(symbol="C/USDT", net_edge=4.0)
+    out = _sort_pairs([p1, p2, p3], "net_edge_bps")
+    assert [p.symbol for p in out] == ["B/USDT", "C/USDT", "A/USDT"]
+
+
+def test_filter_pairs_hide_flags_drops_matches() -> None:
+    """A pair with any hidden flag is dropped; clean pairs survive."""
+
+    p_clean = _mk_pair(symbol="A/USDT", flags=())
+    p_boundary = _mk_pair(symbol="B/USDT", flags=("boundary_lag",))
+    p_zero = _mk_pair(symbol="C/USDT", flags=("zero_lag",))
+    p_multi = _mk_pair(symbol="D/USDT", flags=("low_n_high_corr", "wide_ci"))
+    out = _filter_pairs(
+        [p_clean, p_boundary, p_zero, p_multi],
+        exchanges=None,
+        symbols=None,
+        min_abs_corr=0.0,
+        min_n_obs=0,
+        only_directional=False,
+        hide_flags={"boundary_lag", "wide_ci"},
+    )
+    assert {p.symbol for p in out} == {"A/USDT", "C/USDT"}
+
+
+def test_filter_pairs_hide_flags_none_keeps_everything() -> None:
+    p_clean = _mk_pair(symbol="A/USDT", flags=())
+    p_flagged = _mk_pair(symbol="B/USDT", flags=("boundary_lag", "wide_ci"))
+    out = _filter_pairs(
+        [p_clean, p_flagged],
+        exchanges=None,
+        symbols=None,
+        min_abs_corr=0.0,
+        min_n_obs=0,
+        only_directional=False,
+        hide_flags=None,
+    )
+    assert len(out) == 2
 
 
 # ---------------------------------------------------------------------------

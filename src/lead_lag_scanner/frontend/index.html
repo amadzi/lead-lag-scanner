@@ -132,6 +132,12 @@
       font-size: 11px; font-weight: 600;
       background: var(--pill); color: var(--text);
     }
+    .flag-chip {
+      display: inline-block; padding: 1px 6px; border-radius: 4px;
+      font-size: 10px; font-weight: 600; margin-right: 3px;
+      background: #4a1f23; color: var(--red); border: 1px solid #5a262b;
+      white-space: nowrap;
+    }
     .empty {
       padding: 60px 24px; text-align: center; color: var(--muted);
     }
@@ -221,6 +227,8 @@
         <div class="small" style="margin-bottom: 4px;">Сортировка</div>
         <div class="row-input">
           <select id="sortBy">
+            <option value="tradeability">Скор торговли</option>
+            <option value="net_edge_bps">Чистый эдж</option>
             <option value="edge_bps">Эдж (bps)</option>
             <option value="abs_corr">|Корреляция|</option>
             <option value="n_obs">Наблюдений</option>
@@ -249,6 +257,16 @@
         <span>Только направленные (без CI вокруг 0)</span>
         <input type="checkbox" id="onlyDirectional">
       </label>
+
+      <div style="margin-top: 10px;">
+        <div class="small" style="margin-bottom: 4px;">
+          Скрыть подозрительные сигналы
+        </div>
+        <label class="row"><span title="Лаг прижат к границе сетки — оценка нестабильна">скрыть boundary_lag</span><input type="checkbox" id="hideBoundary" checked></label>
+        <label class="row"><span title="Доверительный интервал лага слишком широкий или пересекает 0">скрыть wide_ci</span><input type="checkbox" id="hideWideCi" checked></label>
+        <label class="row"><span title="|корр| > 0.9 при N < 200 — почти всегда переподгонка">скрыть low_n_high_corr</span><input type="checkbox" id="hideLowN"></label>
+        <label class="row"><span title="Лидер не определён, лаг ≈ 0">скрыть zero_lag</span><input type="checkbox" id="hideZeroLag"></label>
+      </div>
 
       <div style="margin-top: 10px;">
         <div class="small" style="margin-bottom: 4px;">Лимит строк</div>
@@ -326,7 +344,10 @@
             <th class="right">CI (с)</th>
             <th class="right" data-sort="abs_correlation">|Корр|</th>
             <th class="right" data-sort="correlation_at_zero">Корр@0</th>
-            <th class="right" data-sort="edge_bps">Эдж (bps)</th>
+            <th class="right" data-sort="edge_bps" title="Грязный эдж: |corr| × σ × 1e4 − 2 × тейкер">Эдж</th>
+            <th class="right" data-sort="net_edge_bps" title="Чистый эдж: −спред −проскальз −тейкеры">Чистый</th>
+            <th class="right" data-sort="tradeability" title="Композитный скор: net × corr² × √N">Скор</th>
+            <th data-sort="flags" title="Подозрительные признаки оценки">Флаги</th>
             <th class="right" data-sort="n_obs">N</th>
             <th class="right" title="Доля баров с реальным трейдом">A/B%</th>
           </tr>
@@ -380,9 +401,22 @@
           фильтруется по умолчанию.</p>
         <p><b>Корр@0</b> — корреляция без сдвига. Если ≈ |Корр|, лаг
           околонулевой и сигнал про лидерство слабый.</p>
-        <p><b>Эдж (bps)</b> — наивный прокси:
-          <code>|Корр| × σ(ведомого) × 1e4 − 2 × тейкер-комиссия</code>.
-          Не PnL, не учитывает slippage и impact, но показывает порядок.</p>
+        <p><b>Эдж</b> — наивный прокси, считает только тейкеры:
+          <code>|Корр| × σ(ведомого) × 1e4 − 2 × тейкер</code>. Полезен
+          как «сколько вообще двигается», но НЕ как PnL.</p>
+        <p><b>Чистый</b> — тот же эдж минус спред и проскальзывание
+          (раунд-трип, в bps), задаются в <code>config.report</code>.
+          Если он ≤ 0 — пара себя <i>не отбивает</i>, торговать нельзя.</p>
+        <p><b>Скор</b> — композитный рейтинг
+          <code>чистый_эдж × Корр² × √N</code>. Учитывает и потенциал
+          (чистый эдж), и устойчивость (Корр²·√N). Сортировка по умолчанию.</p>
+        <p><b>Флаги</b> — подозрительные признаки оценки:
+          <code>boundary_lag</code> — лаг прижат к границе сетки и
+          скорее всего занижен; <code>wide_ci</code> — доверительный
+          интервал слишком широкий или пересекает 0;
+          <code>low_n_high_corr</code> — |Корр| > 0.9 при N < 200,
+          переподгонка; <code>zero_lag</code> — оба двигаются
+          одновременно, лидера нет.</p>
         <p><b>N</b> — секунд (баров) пересечения данных, где у обеих
           бирж был реальный трейд. Чем больше, тем выше доверие.</p>
         <p><b>A/B%</b> — доля «активных» баров для каждой стороны. Если
@@ -433,12 +467,13 @@ const state = {
   selectedSymbols: new Set(),
   exFilter: "",
   symFilter: "",
-  sortBy: "edge_bps",
+  sortBy: "tradeability",
   sortColumn: null,   // optional client-side override
   sortAsc: false,
   minCorr: 0.30,
   minObs: 60,
   onlyDirectional: false,
+  hideFlags: new Set(["boundary_lag", "wide_ci"]),
   limit: 200,
   refreshSeconds: 30,
   taker: 10,
@@ -518,6 +553,9 @@ async function loadPairs() {
   params.set("min_corr", state.minCorr);
   params.set("min_obs", state.minObs);
   params.set("only_directional", state.onlyDirectional ? "true" : "false");
+  // Always send hide_flags (possibly empty) so the server doesn't fall back
+  // to its own default of "boundary_lag,wide_ci" when the user unchecks them.
+  params.set("hide_flags", Array.from(state.hideFlags).join(","));
   params.set("limit", state.limit);
   if (exSel) params.set("exchanges", exSel.join(","));
   if (symSel) params.set("symbols", symSel.join(","));
@@ -621,6 +659,23 @@ function edgeClass(edge) {
   return "dim";
 }
 
+function netEdgeClass(net) {
+  // Net edge already has spread + slippage subtracted; positive ⇒ green,
+  // anything else ⇒ dim (no middle "yellow" tier — once costs are netted
+  // out, a non-positive number is genuinely untradeable).
+  return net > 0 ? "green" : "dim";
+}
+
+function renderFlags(flags) {
+  if (!flags || flags.length === 0) return '<span class="dim">—</span>';
+  return flags.map(f => `<span class="flag-chip">${f}</span>`).join("");
+}
+
+function fmtScore(x) {
+  if (x === null || x === undefined || Number.isNaN(x)) return "—";
+  return (x >= 0 ? "+" : "") + Math.round(+x).toLocaleString("ru");
+}
+
 function renderPairs() {
   const tbody = document.getElementById("pairsBody");
   const empty = document.getElementById("emptyHint");
@@ -634,7 +689,8 @@ function renderPairs() {
   if (state.sortColumn) {
     const col = state.sortColumn;
     pairs.sort((a, b) => {
-      const va = a[col], vb = b[col];
+      let va = a[col], vb = b[col];
+      if (col === "flags") { va = (va || []).join(","); vb = (vb || []).join(","); }
       if (typeof va === "string") return state.sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
       return state.sortAsc ? (va - vb) : (vb - va);
     });
@@ -644,6 +700,7 @@ function renderPairs() {
       ? "—"
       : `[${fmtSign1(p.lag_ci_low_seconds)}, ${fmtSign1(p.lag_ci_high_seconds)}]`;
     const cls = edgeClass(p.edge_bps);
+    const netCls = netEdgeClass(p.net_edge_bps);
     const leader = p.leader === "none" ? '<span class="dim">—</span>' : `<span class="green">${p.leader}</span>`;
     const follower = p.follower === "none" ? '<span class="dim">—</span>' : `<span class="red">${p.follower}</span>`;
     const lagText = p.leader === "none"
@@ -659,6 +716,9 @@ function renderPairs() {
         <td class="right">${fmt3(p.abs_correlation)}</td>
         <td class="right dim">${fmt3(p.correlation_at_zero)}</td>
         <td class="right ${cls}">${fmtSign1(p.edge_bps)}</td>
+        <td class="right ${netCls}">${fmtSign1(p.net_edge_bps)}</td>
+        <td class="right">${fmtScore(p.tradeability)}</td>
+        <td>${renderFlags(p.flags)}</td>
         <td class="right dim">${p.n_obs}</td>
         <td class="right dim">${fmtPct(p.active_rate_a)}/${fmtPct(p.active_rate_b)}</td>
       </tr>
@@ -718,6 +778,22 @@ document.getElementById("onlyDirectional").addEventListener("change", (e) => {
   state.onlyDirectional = e.target.checked;
   loadPairs();
 });
+
+function wireHideFlag(elemId, flagName) {
+  const el = document.getElementById(elemId);
+  if (!el) return;
+  el.checked = state.hideFlags.has(flagName);
+  el.addEventListener("change", () => {
+    if (el.checked) state.hideFlags.add(flagName);
+    else state.hideFlags.delete(flagName);
+    loadPairs();
+  });
+}
+wireHideFlag("hideBoundary", "boundary_lag");
+wireHideFlag("hideWideCi", "wide_ci");
+wireHideFlag("hideLowN", "low_n_high_corr");
+wireHideFlag("hideZeroLag", "zero_lag");
+
 document.getElementById("limit").addEventListener("change", (e) => {
   state.limit = Math.max(10, parseInt(e.target.value, 10) || 200);
   loadPairs();

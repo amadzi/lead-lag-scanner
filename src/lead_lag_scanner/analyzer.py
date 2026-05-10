@@ -49,6 +49,7 @@ the impact of each fix independently.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from itertools import combinations
 
@@ -77,6 +78,65 @@ class LeadLagResult:
     active_rate_a: float = 1.0  # fraction of overlap bars where exchange_a saw a trade
     active_rate_b: float = 1.0
     n_co_active: int = 0  # bars where both exchanges had real trades, post-mask
+    flags: tuple[str, ...] = ()  # see :func:`_compute_flags`
+
+
+def _compute_flags(
+    *,
+    best_lag_seconds: float,
+    correlation: float,
+    ci_low_seconds: float,
+    ci_high_seconds: float,
+    n_obs: int,
+    lag_grid: LagGrid,
+    resample_seconds: float,
+) -> tuple[str, ...]:
+    """Heuristic sanity flags surfaced alongside each pair.
+
+    None of these are *errors* — a flagged pair is still reported. They
+    exist so the dashboard and report can hide pairs that are statistically
+    pathological (overfit, lag pinned to grid edge, undefined direction)
+    without the user having to reason about thresholds manually. The
+    chosen labels match what the user would write down themselves after
+    eyeballing the table:
+
+    * ``boundary_lag`` — the optimal lag landed within one grid step of
+      ``lag_grid.start`` or ``lag_grid.stop``. This means the true lag is
+      almost certainly *outside* the grid, so the reported value is a
+      lower bound on the magnitude. Widen the grid before trusting it.
+    * ``wide_ci`` — the bootstrap CI either spans both signs or covers
+      more than 50 % of the grid width. The lag estimate is unstable
+      across resamples; trading on it is gambling, not arbitrage.
+    * ``low_n_high_corr`` — ``n_obs < 200`` *and* ``|corr| > 0.9``. With
+      so few observations, a correlation that high is far more likely to
+      be a few coincident pumps than a stable relationship. Classic
+      overfit smell.
+    * ``zero_lag`` — the optimal lag is exactly zero (within the resample
+      grid). There is no leader / follower; nothing to trade with this
+      result.
+    """
+
+    out: list[str] = []
+    grid_low = float(lag_grid.start)
+    grid_high = float(lag_grid.stop)
+    grid_width = grid_high - grid_low
+    edge_tolerance = max(resample_seconds, lag_grid.step) * 1.001
+    if (
+        best_lag_seconds <= grid_low + edge_tolerance
+        or best_lag_seconds >= grid_high - edge_tolerance
+    ):
+        out.append("boundary_lag")
+    ci_known = not (math.isnan(ci_low_seconds) or math.isnan(ci_high_seconds))
+    if ci_known:
+        ci_width = ci_high_seconds - ci_low_seconds
+        spans_zero = ci_low_seconds <= 0 <= ci_high_seconds and ci_width > 0
+        if spans_zero or (grid_width > 0 and ci_width > 0.5 * grid_width):
+            out.append("wide_ci")
+    if n_obs < 200 and abs(correlation) > 0.9:
+        out.append("low_n_high_corr")
+    if abs(best_lag_seconds) < resample_seconds * 0.5:
+        out.append("zero_lag")
+    return tuple(out)
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,6 +590,17 @@ def analyze_pair(
         b_active=b_active if use_mask else None,
         rng=rng,
     )
+    ci_low_seconds = ci_low_steps * config.resample_seconds
+    ci_high_seconds = ci_high_steps * config.resample_seconds
+    flags = _compute_flags(
+        best_lag_seconds=best_lag_seconds,
+        correlation=best_corr,
+        ci_low_seconds=ci_low_seconds,
+        ci_high_seconds=ci_high_seconds,
+        n_obs=effective_obs,
+        lag_grid=config.lag_grid,
+        resample_seconds=config.resample_seconds,
+    )
 
     return LeadLagResult(
         symbol=symbol,
@@ -541,14 +612,15 @@ def analyze_pair(
         correlation_at_zero=corr_at_zero,
         leader=leader,
         follower=follower,
-        lag_ci_low_seconds=ci_low_steps * config.resample_seconds,
-        lag_ci_high_seconds=ci_high_steps * config.resample_seconds,
+        lag_ci_low_seconds=ci_low_seconds,
+        lag_ci_high_seconds=ci_high_seconds,
         follower_return_std=_follower_std(
             follower, exchange_b, ra, rb, a_active, b_active, use_mask
         ),
         active_rate_a=prep.active_rate_a,
         active_rate_b=prep.active_rate_b,
         n_co_active=co_active_count,
+        flags=flags,
     )
 
 

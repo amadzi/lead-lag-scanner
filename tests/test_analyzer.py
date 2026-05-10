@@ -23,6 +23,7 @@ import pytest
 from lead_lag_scanner.analyzer import (
     LeadLagResult,
     _aligned_returns,
+    _compute_flags,
     _resample_with_mask,
     analyze_all,
     analyze_all_with_diagnostics,
@@ -326,6 +327,117 @@ def test_analyze_pair_low_tick_drop_with_active_mask() -> None:
     cfg = _config_for_test(active_mask=True, min_active_rate=0.05, min_obs=50)
     result = analyze_pair("BTC/USDT", "binance", "kucoin", df_a, df_b_sparse, cfg)
     assert result is None
+
+
+# _compute_flags ----------------------------------------------------------
+
+
+def _flag_grid() -> LagGrid:
+    return LagGrid(start=-5.0, stop=5.0, step=0.1)
+
+
+def test_compute_flags_clean_signal_has_no_flags() -> None:
+    flags = _compute_flags(
+        best_lag_seconds=2.0,
+        correlation=0.7,
+        ci_low_seconds=1.8,
+        ci_high_seconds=2.2,
+        n_obs=2000,
+        lag_grid=_flag_grid(),
+        resample_seconds=1.0,
+    )
+    assert flags == ()
+
+
+def test_compute_flags_boundary_lag_at_grid_edge() -> None:
+    grid = _flag_grid()
+    flags = _compute_flags(
+        best_lag_seconds=grid.stop,
+        correlation=0.7,
+        ci_low_seconds=grid.stop - 0.2,
+        ci_high_seconds=grid.stop,
+        n_obs=2000,
+        lag_grid=grid,
+        resample_seconds=1.0,
+    )
+    assert "boundary_lag" in flags
+
+
+def test_compute_flags_wide_ci_when_spans_zero() -> None:
+    flags = _compute_flags(
+        best_lag_seconds=1.5,
+        correlation=0.6,
+        ci_low_seconds=-0.3,
+        ci_high_seconds=2.4,
+        n_obs=2000,
+        lag_grid=_flag_grid(),
+        resample_seconds=1.0,
+    )
+    assert "wide_ci" in flags
+
+
+def test_compute_flags_low_n_high_corr() -> None:
+    flags = _compute_flags(
+        best_lag_seconds=2.0,
+        correlation=0.95,
+        ci_low_seconds=1.8,
+        ci_high_seconds=2.2,
+        n_obs=80,  # under 200 → flag
+        lag_grid=_flag_grid(),
+        resample_seconds=1.0,
+    )
+    assert "low_n_high_corr" in flags
+
+
+def test_compute_flags_zero_lag_within_resample() -> None:
+    flags = _compute_flags(
+        best_lag_seconds=0.0,
+        correlation=0.4,
+        ci_low_seconds=-0.5,
+        ci_high_seconds=0.5,
+        n_obs=2000,
+        lag_grid=_flag_grid(),
+        resample_seconds=1.0,
+    )
+    assert "zero_lag" in flags
+
+
+def test_compute_flags_nan_ci_does_not_trigger_wide_ci() -> None:
+    """If the bootstrap could not produce a CI we must not crash on NaN."""
+
+    flags = _compute_flags(
+        best_lag_seconds=2.0,
+        correlation=0.5,
+        ci_low_seconds=float("nan"),
+        ci_high_seconds=float("nan"),
+        n_obs=2000,
+        lag_grid=_flag_grid(),
+        resample_seconds=1.0,
+    )
+    assert "wide_ci" not in flags
+
+
+def test_analyze_pair_attaches_flags_to_result() -> None:
+    """End-to-end: a synthetic pair with a known lag emits sensible flags."""
+
+    df = _synthetic_trades(
+        n_seconds=1200,
+        leader_exchange="binance",
+        follower_exchange="kucoin",
+        symbol="BTC/USDT",
+        lag_seconds=2,
+    )
+    cfg = _config_for_test()
+    df_a = cast(pd.DataFrame, df[df["exchange"] == "binance"])
+    df_b = cast(pd.DataFrame, df[df["exchange"] == "kucoin"])
+    result = analyze_pair("BTC/USDT", "binance", "kucoin", df_a, df_b, cfg)
+    assert result is not None
+    # Tuple of strings — never a list / never None.
+    assert isinstance(result.flags, tuple)
+    assert all(isinstance(f, str) for f in result.flags)
+
+
+# analyze_pair (active-mask path) ----------------------------------------
 
 
 def test_analyze_pair_active_mask_path_recovers_lag() -> None:

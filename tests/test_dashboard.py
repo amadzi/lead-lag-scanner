@@ -51,7 +51,12 @@ def _result(
 
 
 def _report_cfg() -> ReportConfig:
-    return ReportConfig(taker_bps=10.0, min_abs_correlation=0.0)
+    return ReportConfig(
+        taker_bps=10.0,
+        spread_bps=4.0,
+        slippage_bps=2.0,
+        min_abs_correlation=0.0,
+    )
 
 
 def _dash(**overrides: object) -> DashboardConfig:
@@ -63,6 +68,7 @@ def _dash(**overrides: object) -> DashboardConfig:
         "min_obs": 60,
         "bootstrap_n_iter": 30,
         "only_directional": False,
+        "hide_flags": (),
     }
     base.update(overrides)
     return DashboardConfig(**base)  # type: ignore[arg-type]
@@ -74,7 +80,7 @@ def test_sort_key_edge_bps_orders_by_descending_edge() -> None:
     # low:  0.5 * 0.001 * 1e4 - 20 = -15
     high = _result(symbol="HIGH", corr=0.9, sigma=0.005)
     low = _result(symbol="LOW", corr=0.5, sigma=0.001)
-    out = sorted([low, high], key=_sort_key("edge_bps", 10.0))
+    out = sorted([low, high], key=_sort_key("edge_bps", _report_cfg()))
     assert out[0] is high
     assert out[1] is low
 
@@ -82,12 +88,54 @@ def test_sort_key_edge_bps_orders_by_descending_edge() -> None:
 def test_sort_key_other_axes() -> None:
     a = _result(symbol="A", corr=0.4, lag=0.5, n_obs=200)
     b = _result(symbol="B", corr=0.9, lag=2.5, n_obs=100)
-    out_corr = sorted([a, b], key=_sort_key("abs_corr", 10.0))
+    cfg = _report_cfg()
+    out_corr = sorted([a, b], key=_sort_key("abs_corr", cfg))
     assert out_corr[0] is b
-    out_lag = sorted([a, b], key=_sort_key("lag_abs", 10.0))
+    out_lag = sorted([a, b], key=_sort_key("lag_abs", cfg))
     assert out_lag[0] is b
-    out_obs = sorted([a, b], key=_sort_key("n_obs", 10.0))
+    out_obs = sorted([a, b], key=_sort_key("n_obs", cfg))
     assert out_obs[0] is a
+
+
+def test_sort_key_tradeability_orders_by_descending_score() -> None:
+    cfg = _report_cfg()
+    # tradeability = (gross - 2*taker - spread - slippage) * corr² * √n
+    # high: (45 - 20 - 4 - 2) * 0.81 * √1000 ≈ 487
+    # low:  (5  - 20 - 4 - 2) * 0.25 * √1000 ≈ -166
+    high = _result(symbol="HIGH", corr=0.9, sigma=0.005, n_obs=1000)
+    low = _result(symbol="LOW", corr=0.5, sigma=0.001, n_obs=1000)
+    out = sorted([low, high], key=_sort_key("tradeability", cfg))
+    assert out[0] is high
+
+
+def test_sort_key_net_edge_orders_by_descending_net() -> None:
+    cfg = _report_cfg()
+    high = _result(symbol="HIGH", corr=0.9, sigma=0.005)
+    low = _result(symbol="LOW", corr=0.5, sigma=0.001)
+    out = sorted([low, high], key=_sort_key("net_edge_bps", cfg))
+    assert out[0] is high
+
+
+def test_filter_and_sort_drops_pairs_with_hidden_flags() -> None:
+    cfg = _report_cfg()
+    keep = _result(symbol="KEEP", corr=0.5)
+    flagged = LeadLagResult(
+        symbol="FLAG",
+        exchange_a="binance",
+        exchange_b="kucoin",
+        n_obs=1000,
+        best_lag_seconds=2.0,
+        best_correlation=0.5,
+        correlation_at_zero=0.3,
+        leader="binance",
+        follower="kucoin",
+        lag_ci_low_seconds=1.8,
+        lag_ci_high_seconds=2.2,
+        follower_return_std=0.001,
+        flags=("boundary_lag",),
+    )
+    out = _filter_and_sort([keep, flagged], _dash(hide_flags=("boundary_lag",)), cfg)
+    assert [r.symbol for r in out] == ["KEEP"]
 
 
 def test_filter_drops_low_correlation() -> None:

@@ -348,6 +348,16 @@ analyzer:
 report:
   # Round-trip taker fee assumption used when computing the edge_bps proxy.
   taker_bps: 10.0
+  # Round-trip half-spread paid on entry+exit, in basis points. The default
+  # of 4.0 is deliberately optimistic for tier-1 venues and pessimistic for
+  # microcaps — tune it to your actual venue mix. Used in `net_edge_bps`
+  # and `tradeability` to surface a realistic net-of-cost number alongside
+  # the naive `edge_bps` proxy.
+  spread_bps: 4.0
+  # Round-trip slippage / market-impact assumption, in basis points. Covers
+  # adverse selection on entry and exit beyond the quoted spread. Tune this
+  # against post-trade analytics for your venue + size.
+  slippage_bps: 2.0
   # Output paths (relative to the repo root).
   markdown_path: reports/report.md
   json_path: reports/leaders.json
@@ -361,10 +371,18 @@ dashboard:
   # starts. Use `--strict` (or override here) to apply report-grade thresholds.
   refresh_seconds: 30
   top_k: 30
-  # One of: edge_bps, abs_corr, n_obs, lag_abs.
-  sort_by: edge_bps
+  # One of: tradeability, edge_bps, net_edge_bps, abs_corr, n_obs, lag_abs.
+  # `tradeability` is the composite ranking metric (see ReportConfig docstring).
+  sort_by: tradeability
   min_abs_correlation: 0.3
   min_obs: 60
   bootstrap_n_iter: 30
   # If true, hide pairs with leader == "none" (zero-lag, no directional edge).
   only_directional: false
+  # Sanity flags to suppress in the dashboard. `boundary_lag` (lag pinned to
+  # the grid edge) and `wide_ci` (CI spans both signs or covers >50% of grid)
+  # almost always indicate an unstable estimate, so they're hidden by default.
+  # Other valid flags: `low_n_high_corr`, `zero_lag`. Use `[]` to show all.
+  hide_flags:
+    - boundary_lag
+    - wide_ci

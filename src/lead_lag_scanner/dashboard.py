@@ -31,20 +31,24 @@ from rich.text import Text
 
 from .analyzer import LeadLagResult, analyze_all
 from .config import AnalyzerConfig, BootstrapConfig, Config, DashboardConfig, ReportConfig
-from .reporter import _edge_bps
+from .reporter import _edge_bps, _net_edge_bps, _tradeability
 from .storage import load_trades
 
 log = structlog.get_logger()
 
 
-def _sort_key(sort_by: str, taker_bps: float) -> Callable[[LeadLagResult], float]:
+def _sort_key(sort_by: str, report_cfg: ReportConfig) -> Callable[[LeadLagResult], float]:
     """Return a key function ranking results so that *better* comes first.
 
     All keys return *negative* values because ``list.sort`` is ascending.
     """
 
+    if sort_by == "tradeability":
+        return lambda r: -_tradeability(r, report_cfg)
     if sort_by == "edge_bps":
-        return lambda r: -_edge_bps(r, taker_bps)
+        return lambda r: -_edge_bps(r, report_cfg.taker_bps)
+    if sort_by == "net_edge_bps":
+        return lambda r: -_net_edge_bps(r, report_cfg)
     if sort_by == "abs_corr":
         return lambda r: -abs(r.best_correlation)
     if sort_by == "n_obs":
@@ -59,12 +63,20 @@ def _filter_and_sort(
     dash: DashboardConfig,
     report_cfg: ReportConfig,
 ) -> list[LeadLagResult]:
-    """Apply correlation / directional filters and sort by ``dash.sort_by``."""
+    """Apply correlation / directional / sanity-flag filters and sort.
+
+    The terminal dashboard hides ``boundary_lag`` and ``wide_ci`` by
+    default — those are the two flag classes that almost always indicate
+    an unstable estimate rather than a real lead-lag.
+    """
 
     out = [r for r in results if abs(r.best_correlation) >= dash.min_abs_correlation]
+    hide = dash.hide_flags
+    if hide:
+        out = [r for r in out if not any(f in hide for f in r.flags)]
     if dash.only_directional:
         out = [r for r in out if r.leader != "none"]
-    out.sort(key=_sort_key(dash.sort_by, report_cfg.taker_bps))
+    out.sort(key=_sort_key(dash.sort_by, report_cfg))
     return out
 
 
@@ -80,6 +92,30 @@ def _edge_style(edge: float, taker_bps: float) -> str:
     if edge > -taker_bps:
         return "yellow"
     return "dim"
+
+
+def _net_edge_style(net_edge: float) -> str:
+    """Net-edge colour: green if it survives all costs, dim otherwise.
+
+    There's no middle "yellow" tier here because once spread + slippage
+    are netted out, a non-positive number is genuinely untradeable.
+    """
+
+    if net_edge > 0:
+        return "bold green"
+    return "dim"
+
+
+def _flags_text(flags: tuple[str, ...]) -> Text:
+    """Render sanity flags as a compact, colourised cell.
+
+    Empty ⇒ "—" in dim. Any flag ⇒ comma-joined in red so they pop in
+    the table even when the row otherwise looks attractive.
+    """
+
+    if not flags:
+        return Text("—", style="dim")
+    return Text(",".join(flags), style="red")
 
 
 def render_table(
@@ -110,11 +146,16 @@ def render_table(
     table.add_column("CI (s)", justify="center", style="dim")
     table.add_column("|corr|", justify="right")
     table.add_column("σ (bps)", justify="right", style="dim")
-    table.add_column("edge (bps)", justify="right", style="bold")
+    table.add_column("edge (bps)", justify="right")
+    table.add_column("net (bps)", justify="right", style="bold")
+    table.add_column("score", justify="right")
+    table.add_column("flags", justify="left")
     table.add_column("n", justify="right", style="dim")
 
     for r in rows:
         edge = _edge_bps(r, report_cfg.taker_bps)
+        net = _net_edge_bps(r, report_cfg)
+        score = _tradeability(r, report_cfg)
         leader = r.leader if r.leader != "none" else "—"
         follower = r.follower if r.follower != "none" else "—"
         sigma_bps = r.follower_return_std * 1e4
@@ -127,6 +168,9 @@ def render_table(
             f"{abs(r.best_correlation):.3f}",
             f"{sigma_bps:.1f}",
             Text(f"{edge:+.1f}", style=_edge_style(edge, report_cfg.taker_bps)),
+            Text(f"{net:+.1f}", style=_net_edge_style(net)),
+            f"{score:+.0f}",
+            _flags_text(r.flags),
             f"{r.n_obs}",
         )
 

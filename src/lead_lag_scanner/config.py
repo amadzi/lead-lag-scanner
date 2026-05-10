@@ -85,7 +85,21 @@ class AnalyzerConfig:
 
 @dataclass(frozen=True, slots=True)
 class ReportConfig:
+    """Cost assumptions and report output paths.
+
+    The ``edge_bps`` proxy in :func:`reporter._edge_bps` only nets out
+    ``2 × taker_bps`` (one side enters, one side exits). Spread and
+    slippage are *not* free and are typically larger than the taker fee on
+    the kind of microcap pairs that surface in this scanner. ``spread_bps``
+    and ``slippage_bps`` are subtracted in :func:`reporter._net_edge_bps`
+    so the dashboard can show a realistic net-of-cost number alongside the
+    naive proxy. Both are round-trip totals (entry + exit), in basis
+    points, and configurable per-deployment.
+    """
+
     taker_bps: float = 10.0
+    spread_bps: float = 4.0
+    slippage_bps: float = 2.0
     markdown_path: Path = Path("reports/report.md")
     json_path: Path = Path("reports/leaders.json")
     min_abs_correlation: float = 0.4
@@ -100,15 +114,22 @@ class DashboardConfig:
     Defaults are deliberately *looser* than :class:`ReportConfig` /
     :class:`AnalyzerConfig` so the dashboard shows preliminary signal a few
     minutes after collection starts (instead of waiting for ``min_obs=600``).
+
+    ``hide_flags`` is a tuple of sanity-flag names to suppress in the
+    rendered table. The default hides ``boundary_lag`` and ``wide_ci`` —
+    pairs whose lag is pinned to the grid edge or whose CI spans both
+    signs almost never trade out. Override with an empty tuple to see
+    everything.
     """
 
     refresh_seconds: float = 30.0
     top_k: int = 30
-    sort_by: str = "edge_bps"  # one of: edge_bps, abs_corr, n_obs, lag_abs
+    sort_by: str = "tradeability"
     min_abs_correlation: float = 0.3
     min_obs: int = 60
     bootstrap_n_iter: int = 30
     only_directional: bool = False  # if True, drop pairs with leader == "none"
+    hide_flags: tuple[str, ...] = ("boundary_lag", "wide_ci")
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,17 +190,52 @@ def _load_analyzer(d: dict[str, Any]) -> AnalyzerConfig:
 def _load_report(d: dict[str, Any]) -> ReportConfig:
     return ReportConfig(
         taker_bps=float(d.get("taker_bps", 10.0)),
+        spread_bps=float(d.get("spread_bps", 4.0)),
+        slippage_bps=float(d.get("slippage_bps", 2.0)),
         markdown_path=_coerce_path(d.get("markdown_path"), Path("reports/report.md")),
         json_path=_coerce_path(d.get("json_path"), Path("reports/leaders.json")),
         min_abs_correlation=float(d.get("min_abs_correlation", 0.4)),
     )
 
 
-_DASHBOARD_SORT_KEYS = ("edge_bps", "abs_corr", "n_obs", "lag_abs")
+_DASHBOARD_SORT_KEYS = (
+    "tradeability",
+    "edge_bps",
+    "net_edge_bps",
+    "abs_corr",
+    "n_obs",
+    "lag_abs",
+)
+_KNOWN_FLAGS = ("boundary_lag", "wide_ci", "low_n_high_corr", "zero_lag")
+
+
+def _coerce_flag_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse ``hide_flags`` from YAML (list / CSV string / None)."""
+
+    if value is None:
+        return default
+    if isinstance(value, str):
+        items = [s.strip() for s in value.split(",") if s.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = [str(s).strip() for s in value if str(s).strip()]
+    else:
+        raise ValueError(f"dashboard.hide_flags must be list or CSV string, got {value!r}")
+    bad = [f for f in items if f not in _KNOWN_FLAGS]
+    if bad:
+        raise ValueError(
+            f"dashboard.hide_flags has unknown flag(s): {bad!r}; known: {_KNOWN_FLAGS}"
+        )
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in items:
+        if f not in seen:
+            out.append(f)
+            seen.add(f)
+    return tuple(out)
 
 
 def _load_dashboard(d: dict[str, Any]) -> DashboardConfig:
-    sort_by = str(d.get("sort_by", "edge_bps"))
+    sort_by = str(d.get("sort_by", "tradeability"))
     if sort_by not in _DASHBOARD_SORT_KEYS:
         raise ValueError(
             f"dashboard.sort_by must be one of {_DASHBOARD_SORT_KEYS}, got {sort_by!r}"
@@ -192,6 +248,7 @@ def _load_dashboard(d: dict[str, Any]) -> DashboardConfig:
         min_obs=int(d.get("min_obs", 60)),
         bootstrap_n_iter=int(d.get("bootstrap_n_iter", 30)),
         only_directional=bool(d.get("only_directional", False)),
+        hide_flags=_coerce_flag_tuple(d.get("hide_flags"), ("boundary_lag", "wide_ci")),
     )
 
 

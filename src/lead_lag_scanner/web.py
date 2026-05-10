@@ -41,11 +41,12 @@ from .config import (
     BootstrapConfig,
     Config,
     DashboardConfig,
+    ReportConfig,
     load_runtime_symbols,
     merge_runtime_symbols,
     save_runtime_symbols,
 )
-from .reporter import _edge_bps
+from .reporter import _edge_bps, _gross_edge_bps, _net_edge_bps, _tradeability
 from .storage import load_trades
 
 log = structlog.get_logger(__name__)
@@ -167,6 +168,10 @@ class PairOut(BaseModel):
     lag_ci_high_seconds: float
     follower_return_std: float
     edge_bps: float
+    gross_edge_bps: float
+    net_edge_bps: float
+    tradeability: float
+    flags: list[str]
     n_obs: int
     n_co_active: int
     active_rate_a: float
@@ -232,7 +237,7 @@ def _normalise_symbol(raw: str) -> str:
     return clean
 
 
-def _result_to_pair(r: LeadLagResult, taker_bps: float) -> PairOut:
+def _result_to_pair(r: LeadLagResult, report_cfg: ReportConfig) -> PairOut:
     return PairOut(
         symbol=r.symbol,
         exchange_a=r.exchange_a,
@@ -246,7 +251,11 @@ def _result_to_pair(r: LeadLagResult, taker_bps: float) -> PairOut:
         lag_ci_low_seconds=float(r.lag_ci_low_seconds),
         lag_ci_high_seconds=float(r.lag_ci_high_seconds),
         follower_return_std=float(r.follower_return_std),
-        edge_bps=float(_edge_bps(r, taker_bps)),
+        edge_bps=float(_edge_bps(r, report_cfg.taker_bps)),
+        gross_edge_bps=float(_gross_edge_bps(r)),
+        net_edge_bps=float(_net_edge_bps(r, report_cfg)),
+        tradeability=float(_tradeability(r, report_cfg)),
+        flags=list(r.flags),
         n_obs=int(r.n_obs),
         n_co_active=int(r.n_co_active),
         active_rate_a=float(r.active_rate_a),
@@ -262,7 +271,15 @@ def _filter_pairs(
     min_abs_corr: float,
     min_n_obs: int,
     only_directional: bool,
+    hide_flags: set[str] | None = None,
 ) -> list[PairOut]:
+    """Apply correlation / observation / exchange / symbol / flag filters.
+
+    ``hide_flags`` removes any pair whose ``flags`` set intersects the
+    provided set. The web UI uses this to hide ``boundary_lag`` and
+    ``wide_ci`` by default.
+    """
+
     out: list[PairOut] = []
     for p in pairs:
         if p.abs_correlation < min_abs_corr:
@@ -277,12 +294,16 @@ def _filter_pairs(
             continue
         if symbols is not None and p.symbol not in symbols:
             continue
+        if hide_flags and any(f in hide_flags for f in p.flags):
+            continue
         out.append(p)
     return out
 
 
 _SORT_KEYS = {
+    "tradeability": lambda p: -p.tradeability,
     "edge_bps": lambda p: -p.edge_bps,
+    "net_edge_bps": lambda p: -p.net_edge_bps,
     "abs_corr": lambda p: -p.abs_correlation,
     "n_obs": lambda p: -float(p.n_obs),
     "lag_abs": lambda p: -abs(p.best_lag_seconds),
@@ -366,12 +387,13 @@ def _build_pairs_response(
     min_corr: float,
     min_obs: int,
     only_directional: bool,
+    hide_flags: str | None,
     limit: int,
 ) -> PairsOut:
     with state.lock:
         snap = state.snapshot
-    taker = state.base_config.report.taker_bps
-    all_pairs = [_result_to_pair(r, taker) for r in snap.results]
+    report_cfg = state.base_config.report
+    all_pairs = [_result_to_pair(r, report_cfg) for r in snap.results]
     filtered = _filter_pairs(
         all_pairs,
         exchanges=_split_csv(exchanges),
@@ -379,6 +401,7 @@ def _build_pairs_response(
         min_abs_corr=max(0.0, min(1.0, float(min_corr))),
         min_n_obs=max(0, int(min_obs)),
         only_directional=bool(only_directional),
+        hide_flags=_split_csv(hide_flags),
     )
     ranked = _sort_pairs(filtered, sort_by)[: max(1, int(limit))]
     return PairsOut(
@@ -485,12 +508,13 @@ def create_app(config: Config, *, refresh_seconds: float | None = None) -> FastA
 
     @app.get("/api/pairs", response_model=PairsOut)
     def get_pairs(
-        sort_by: str = "edge_bps",
+        sort_by: str = "tradeability",
         exchanges: str | None = None,
         symbols: str | None = None,
         min_corr: float = 0.0,
         min_obs: int = 0,
         only_directional: bool = False,
+        hide_flags: str | None = "boundary_lag,wide_ci",
         limit: int = 200,
     ) -> PairsOut:
         return _build_pairs_response(
@@ -501,6 +525,7 @@ def create_app(config: Config, *, refresh_seconds: float | None = None) -> FastA
             min_corr=min_corr,
             min_obs=min_obs,
             only_directional=only_directional,
+            hide_flags=hide_flags,
             limit=limit,
         )
 
