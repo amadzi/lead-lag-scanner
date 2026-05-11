@@ -8,6 +8,11 @@ themselves live in the integration suite.
 
 from __future__ import annotations
 
+import asyncio
+import time
+from dataclasses import dataclass
+from typing import Any
+
 import pytest
 
 from lead_lag_scanner.collector import (
@@ -15,10 +20,13 @@ from lead_lag_scanner.collector import (
     _RATE_LIMIT_BACKOFF_SECONDS,
     _RATE_LIMIT_JITTER_FRACTION,
     _TRANSIENT_BACKOFF_SECONDS,
+    CollectionStats,
     _is_permanent_error,
     _is_rate_limit_error,
     _next_backoff,
     _normalise_error_text,
+    _run_for_symbol,
+    _watch_trades_loop,
 )
 
 # ---------------------------------------------------------------------------
@@ -236,3 +244,178 @@ def test_max_consecutive_failures_is_large_enough_to_ride_out_brief_blips() -> N
         idx = min(i, len(_TRANSIENT_BACKOFF_SECONDS) - 1)
         transient_total += _TRANSIENT_BACKOFF_SECONDS[idx]
     assert transient_total >= 50.0
+
+
+# ---------------------------------------------------------------------------
+# WS → REST fallback when watch_trades dies before producing any trades
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeClient:
+    """Minimal stand-in for a ccxt(.pro) client with controllable behaviour."""
+
+    error: Exception | None = None  # raised on every call when set
+    batches: list[list[dict[str, Any]]] | None = None
+    calls: int = 0
+
+    async def watch_trades(self, _symbol: str) -> list[dict[str, Any]]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        if self.batches:
+            return self.batches.pop(0) if self.batches else []
+        return []
+
+    async def fetch_trades(self, _symbol: str, since: int | None = None) -> list[dict[str, Any]]:
+        return await self.watch_trades(_symbol)
+
+
+@dataclass
+class _FakeHandle:
+    exchange_id: str
+    client: _FakeClient
+    supports_watch_trades: bool = True
+
+
+class _FakeWriter:
+    def __init__(self) -> None:
+        self.records: list[Any] = []
+
+    def append(self, tr: Any) -> None:
+        self.records.append(tr)
+
+    def close(self) -> None:
+        pass
+
+
+async def test_watch_loop_signals_fallback_on_protobuf_before_first_success() -> None:
+    """The real-world mexc symptom: ccxt.pro raises ``NotSupported: ... protobuf ...``
+    on the first frame. We must signal the caller to fall back to REST
+    (return ``True``) instead of letting the pair go dark.
+    """
+
+    client = _FakeClient(
+        error=RuntimeError("mexc requires protobuf to decode messages"),
+    )
+    handle = _FakeHandle(exchange_id="mexc", client=client)
+    stop = asyncio.Event()
+    stats = CollectionStats()
+    writer = _FakeWriter()
+
+    should_fallback = await _watch_trades_loop(handle, "BTC/USDT", writer, stats, stop)  # type: ignore[arg-type]
+
+    assert should_fallback is True
+    assert client.calls == 1
+    assert stats.errors == 1
+    assert writer.records == []
+
+
+async def test_watch_loop_does_not_signal_fallback_after_a_successful_batch() -> None:
+    """Once the WS loop has written at least one trade, a later permanent
+    error must NOT trigger REST fallback — that would double-write the
+    same symbol and corrupt the (timestamp, trade_id) dedup logic.
+    """
+
+    # The collector drops any trade whose reported timestamp drifts more
+    # than ~1 hour from the local receive clock, so use ``now`` here.
+    now_ms = int(time.time() * 1000)
+    batches: list[list[dict[str, Any]]] = [
+        [
+            {
+                "id": "1",
+                "timestamp": now_ms,
+                "price": 30000.0,
+                "amount": 0.5,
+                "side": "buy",
+            }
+        ],
+    ]
+
+    class _OneGoodThenBoom(_FakeClient):
+        async def watch_trades(self, _symbol: str) -> list[dict[str, Any]]:
+            self.calls += 1
+            if batches:
+                return batches.pop(0)
+            raise RuntimeError("mexc requires protobuf to decode messages")
+
+    client = _OneGoodThenBoom()
+    handle = _FakeHandle(exchange_id="mexc", client=client)
+    stop = asyncio.Event()
+    stats = CollectionStats()
+    writer = _FakeWriter()
+
+    should_fallback = await _watch_trades_loop(handle, "BTC/USDT", writer, stats, stop)  # type: ignore[arg-type]
+
+    assert should_fallback is False
+    assert client.calls == 2  # one success, one permanent error
+    assert stats.trades_written == 1
+
+
+async def test_run_for_symbol_falls_back_to_rest_when_ws_was_never_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end of the dispatcher: when ``supports_watch_trades`` is True
+    but the WS loop signals fallback, the dispatcher must invoke the REST
+    loop with the same arguments. This guards against the regression that
+    used to silently mute mexc for the entire run.
+    """
+
+    calls: dict[str, int] = {"watch": 0, "fetch": 0}
+
+    async def _fake_has_market(_handle: Any, _symbol: str) -> bool:
+        return True
+
+    async def _fake_watch_loop(*_a: Any, **_kw: Any) -> bool:
+        calls["watch"] += 1
+        return True  # signal fallback
+
+    async def _fake_fetch_loop(*_a: Any, **_kw: Any) -> None:
+        calls["fetch"] += 1
+
+    monkeypatch.setattr("lead_lag_scanner.collector.has_market", _fake_has_market)
+    monkeypatch.setattr("lead_lag_scanner.collector._watch_trades_loop", _fake_watch_loop)
+    monkeypatch.setattr("lead_lag_scanner.collector._fetch_trades_loop", _fake_fetch_loop)
+
+    handle = _FakeHandle(exchange_id="mexc", client=_FakeClient())
+    stop = asyncio.Event()
+    stats = CollectionStats()
+    writer = _FakeWriter()
+
+    await _run_for_symbol(handle, "BTC/USDT", writer, stats, stop, rest_poll_interval=1.0)  # type: ignore[arg-type]
+
+    assert calls == {"watch": 1, "fetch": 1}
+    assert stats.pairs_active == 1
+
+
+async def test_run_for_symbol_skips_rest_when_ws_already_collected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If WS already produced trades and only later died, do NOT fall back —
+    REST would re-pull overlapping history and double-write.
+    """
+
+    calls: dict[str, int] = {"watch": 0, "fetch": 0}
+
+    async def _fake_has_market(_handle: Any, _symbol: str) -> bool:
+        return True
+
+    async def _fake_watch_loop(*_a: Any, **_kw: Any) -> bool:
+        calls["watch"] += 1
+        return False  # do NOT fall back
+
+    async def _fake_fetch_loop(*_a: Any, **_kw: Any) -> None:
+        calls["fetch"] += 1
+
+    monkeypatch.setattr("lead_lag_scanner.collector.has_market", _fake_has_market)
+    monkeypatch.setattr("lead_lag_scanner.collector._watch_trades_loop", _fake_watch_loop)
+    monkeypatch.setattr("lead_lag_scanner.collector._fetch_trades_loop", _fake_fetch_loop)
+
+    handle = _FakeHandle(exchange_id="binance", client=_FakeClient())
+    stop = asyncio.Event()
+    stats = CollectionStats()
+    writer = _FakeWriter()
+
+    await _run_for_symbol(handle, "BTC/USDT", writer, stats, stop, rest_poll_interval=1.0)  # type: ignore[arg-type]
+
+    assert calls == {"watch": 1, "fetch": 0}

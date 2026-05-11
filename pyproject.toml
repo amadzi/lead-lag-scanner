@@ -25,7 +25,14 @@ dependencies = [
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.9.0", "seaborn>=0.13.0"]
-ws = ["ccxt[pro]>=4.4.0"]
+ws = [
+    "ccxt[pro]>=4.4.0",
+    # MEXC's ccxt.pro client decodes WS frames with protobuf. Without this
+    # package every WS message raises NotSupported, hits the 5-failure
+    # threshold, and permanently disables the (exchange, symbol) pair for
+    # the rest of the run. Version pinned to what ccxt.pro 4.4.x expects.
+    "protobuf>=5.29.5",
+]
 
 [project.scripts]
 lead-lag-scanner = "lead_lag_scanner.cli:cli"

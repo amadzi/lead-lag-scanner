@@ -337,11 +337,22 @@ async def _watch_trades_loop(
     writer: TradeWriter,
     stats: CollectionStats,
     stop_event: asyncio.Event,
-) -> None:
+) -> bool:
+    """Stream trades via ``watch_trades``.
+
+    Returns ``True`` when the WS path is dead (permanent error / failure
+    cap hit) **before any successful batch was received**, signalling the
+    caller to fall back to REST polling. Returns ``False`` otherwise
+    (either the loop exited cleanly via ``stop_event``, or it died after
+    already collecting trades — in both cases REST fallback would just
+    double-write).
+    """
+
     client = handle.client
     seen: set[str] = set()
     backoff_idx = 0
     consecutive_failures = 0
+    had_success = False
     while not stop_event.is_set():
         try:
             trades: list[dict[str, Any]] = await client.watch_trades(symbol)
@@ -351,31 +362,37 @@ async def _watch_trades_loop(
             stats.errors += 1
             consecutive_failures += 1
             if _is_permanent_error(exc):
-                # Log once at INFO and stop forever — there is no value in
-                # retrying a NotSupported / apiKey-required / protobuf-frame
-                # error every second on this (exchange, symbol) pair.
+                # NotSupported / apiKey-required / protobuf-frame: retrying
+                # is hopeless. If we never got a single trade, signal the
+                # caller to retry as REST (`fetch_trades` works for these
+                # exchanges even when ccxt.pro's `watch_trades` doesn't —
+                # e.g. mexc without the `protobuf` package, or luno's
+                # auth-gated WS feed).
+                fallback = not had_success
                 log.info(
                     "watch_trades permanently disabled for symbol",
                     exchange=handle.exchange_id,
                     symbol=symbol,
                     error=f"{type(exc).__name__}: {exc}",
+                    rest_fallback=fallback,
                 )
-                return
+                return fallback
             if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                # Give up on this (exchange, symbol) pair: we've burned the
-                # full backoff schedule without ever seeing a successful
-                # batch, so further retries would just add log noise.
+                # Burned the full transient backoff schedule without ever
+                # seeing a successful batch — further retries are noise.
                 # Catches upbit's 1000-on-keepalive cycle, kucoin's
                 # "Cannot write to closing transport", whitebit ws closures,
-                # and mexc ping-pong timeouts without per-exchange knowledge.
+                # mexc ping-pong timeouts. If nothing ever worked, try REST.
+                fallback = not had_success
                 log.info(
                     "watch_trades disabled after consecutive failures",
                     exchange=handle.exchange_id,
                     symbol=symbol,
                     consecutive=consecutive_failures,
                     last_error=str(exc),
+                    rest_fallback=fallback,
                 )
-                return
+                return fallback
             rate_limited = _is_rate_limit_error(exc)
             sleep_for, backoff_idx = _next_backoff(backoff_idx, rate_limited=rate_limited)
             log.warning(
@@ -389,7 +406,7 @@ async def _watch_trades_loop(
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
-                return
+                return False
             except TimeoutError:
                 continue
         # ccxt.pro delivers trades in batches; capture the local clock once
@@ -402,6 +419,7 @@ async def _watch_trades_loop(
         # doesn't keep us in slow mode (or one error away from being muted).
         backoff_idx = 0
         consecutive_failures = 0
+        had_success = True
         for raw in trades:
             tr = _normalise_trade(handle.exchange_id, symbol, raw, local_recv_ns)
             if tr is None:
@@ -417,6 +435,7 @@ async def _watch_trades_loop(
             stats.trades_written += 1
         if len(seen) > 100_000:
             seen = set(list(seen)[-50_000:])
+    return False
 
 
 async def _fetch_trades_loop(
@@ -527,7 +546,19 @@ async def _run_for_symbol(
         return
     stats.pairs_active += 1
     if handle.supports_watch_trades:
-        await _watch_trades_loop(handle, symbol, writer, stats, stop_event)
+        # ``_watch_trades_loop`` returns True when the WS path bricked
+        # itself before producing any trades (NotSupported / missing
+        # protobuf decoder / immediate consecutive failures). In that case
+        # the REST path is almost always still healthy, so try it instead
+        # of letting the pair go dark for the rest of the session.
+        should_fallback = await _watch_trades_loop(handle, symbol, writer, stats, stop_event)
+        if should_fallback and not stop_event.is_set():
+            log.info(
+                "falling back from watch_trades to fetch_trades",
+                exchange=handle.exchange_id,
+                symbol=symbol,
+            )
+            await _fetch_trades_loop(handle, symbol, writer, stats, stop_event, rest_poll_interval)
     else:
         await _fetch_trades_loop(handle, symbol, writer, stats, stop_event, rest_poll_interval)
 
