@@ -57,6 +57,8 @@ exchanges:
   - bigone
   - bitopro
   - bitso
+  - bitteam
+  - blockchaincom
   - btcturk
   - coinmetro
   - coinsph
@@ -66,7 +68,21 @@ exchanges:
   - latoken
   - luno
   - novadax
+  - p2b
+  - xt
   - zebpay
+  # NOT included:
+  # - hyperliquid, backpack: native USDC quote (~280 / ~82 USDC pairs but
+  #   <=5 USDT pairs each), so they won't match the USDT-only symbol list
+  #   below. Re-add once we support USDC-quoted symbols.
+  # - dydx, apex, aster, bitmex, deribit, hyperliquid-perp, blofin, bydfi,
+  #   binanceusdm, krakenfutures, kucoinfutures: derivatives-only venues.
+  #   The analyzer compares last-trade prices and would silently mix spot
+  #   with perp marks, which is wrong (basis + funding drift make the lag
+  #   meaningless).
+  # - tokocrypto, bithumb, coincheck, bitbank, bittrade, mercado,
+  #   coinmate, coinone, coinspot: zero USDT spot pairs (KRW/JPY/EUR/BRL
+  #   local quotes only).
 
 symbols:
   # ccxt unified symbols. The collector silently skips (exchange, symbol)

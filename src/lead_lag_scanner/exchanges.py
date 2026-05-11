@@ -84,6 +84,8 @@ SUPPORTED_EXCHANGES: tuple[str, ...] = (
     "bigone",
     "bitopro",
     "bitso",
+    "bitteam",
+    "blockchaincom",
     "btcturk",
     "coinmetro",
     "coinsph",
@@ -93,6 +95,8 @@ SUPPORTED_EXCHANGES: tuple[str, ...] = (
     "latoken",
     "luno",
     "novadax",
+    "p2b",
+    "xt",
     "zebpay",
 )
 
