@@ -149,12 +149,35 @@ class ExchangeDiagnostics:
     clock. The analyzer subtracts the cross-exchange median of these values
     from each timestamp, so only the *relative* differences end up shifting
     the data.
+
+    ``flags`` reports diagnostic conditions:
+
+    * ``clock_skew_outlier`` — the exchange's ``transport_latency_p50_ms``
+      is far enough from the trusted-core consensus that it was excluded
+      from the consensus computation. Likely cause is non-standard
+      timestamp semantics (batched delivery, different epoch, parsed
+      unit mismatch). Its post-calibration timestamps are still aligned
+      to the consensus timeline, but lag estimates against it should be
+      treated as suspect.
+    * ``slow_tape`` — the exchange's tape arrives more than 10 seconds
+      after the trade nominally happened. Even after clock alignment,
+      lead/lag estimates derived from its prices are bounded above by
+      the bar resolution, not by true sub-second arbitrage windows.
     """
 
     exchange: str
     n_trades: int
     transport_latency_p50_ms: float  # median local_recv - exchange_ts
     clock_offset_ms: float  # offset applied during calibration
+    flags: tuple[str, ...] = ()
+
+
+_SLOW_TAPE_MS = 10_000.0  # >10s arrival delay ⇒ tag as slow_tape
+
+# Floor on the trimming threshold so we don't over-trim when MAD collapses
+# on a tightly-clustered dataset. 5 seconds is more than 10x a typical
+# transcontinental WS RTT (~250 ms).
+_CONSENSUS_TRIM_FLOOR_MS = 5_000.0
 
 
 def compute_clock_offsets(
@@ -166,12 +189,29 @@ def compute_clock_offsets(
 
     The offset for exchange ``E`` is the median of
     ``local_recv_ts_ns / 1e6 − exchange_ts_ms`` across all of ``E``'s
-    trades that have a non-zero ``local_recv_ts_ns``. The *consensus
-    median* across exchanges is subtracted before applying the offset, so
-    only the *relative* skew between exchanges shifts the data.
+    trades that have a non-zero ``local_recv_ts_ns``. A *consensus median*
+    across the trusted core of exchanges is subtracted before applying
+    the offset, so only the *relative* skew between exchanges shifts the
+    data.
 
     Trades with ``local_recv_ts_ns == 0`` (legacy shards) or whose drift
     exceeds ``max_drift_seconds`` are excluded from the median.
+
+    **Robust consensus.** A few exchanges (lbank, hashkey, hollaex,
+    coinmetro, phemex in our smoke runs) report timestamps that are
+    minutes off from the matching-engine clock — likely because their
+    public tape is delivered in bursts stamped at delivery time, or the
+    `timestamp` field is the order-creation rather than execution time.
+    Including them in the consensus drags the cross-exchange median up
+    by seconds, which then back-shifts well-behaved exchanges (binance,
+    okx, kraken, gate, …) by the same amount and manufactures phantom
+    5-second lags between them. We therefore compute a *trimmed*
+    consensus that excludes any exchange whose median delta lies more
+    than ``max(5s, 3 · MAD)`` from the rough cohort median. Outliers are
+    still calibrated against the trusted consensus (their post-shift
+    timestamps land in the same frame as everyone else), but they are
+    flagged ``clock_skew_outlier`` so the dashboard can warn the user
+    not to trust sub-second lag estimates against them.
 
     The returned ``offsets`` map values that are ready to be *added* to
     ``timestamp_ms`` (so a positive offset means "this exchange's stamps
@@ -208,7 +248,24 @@ def compute_clock_offsets(
 
     medians_np = np.asarray(medians.to_numpy(), dtype="float64")
     sizes_np = np.asarray(sizes.to_numpy(), dtype="int64")
-    consensus = float(np.median(medians_np))
+
+    # Robust consensus: trim outliers via MAD before taking the median.
+    rough_consensus = float(np.median(medians_np))
+    abs_dev = np.abs(medians_np - rough_consensus)
+    mad = float(np.median(abs_dev))
+    # 3 * 1.4826 * MAD ~ 3*sigma for normal-ish data; floor at 5 s so we
+    # don't over-trim a tight cohort.
+    trim_threshold = max(_CONSENSUS_TRIM_FLOOR_MS, 3.0 * 1.4826 * mad)
+    trusted_mask = abs_dev <= trim_threshold
+    # Require at least a handful of trusted exchanges, otherwise fall back
+    # to the untrimmed median (better than nothing on tiny datasets).
+    min_trusted = max(3, int(0.3 * len(medians_np)))
+    if int(trusted_mask.sum()) >= min_trusted:
+        consensus = float(np.median(medians_np[trusted_mask]))
+    else:
+        consensus = rough_consensus
+        trusted_mask = np.ones_like(trusted_mask)
+
     diags: list[ExchangeDiagnostics] = []
     offsets: dict[str, float] = {}
     for i, ex_idx in enumerate(medians.index):
@@ -221,12 +278,18 @@ def compute_clock_offsets(
         # negative offset (pulled earlier).
         applied = consensus - median_ms
         offsets[ex] = applied
+        flags: list[str] = []
+        if not bool(trusted_mask[i]):
+            flags.append("clock_skew_outlier")
+        if median_ms >= _SLOW_TAPE_MS:
+            flags.append("slow_tape")
         diags.append(
             ExchangeDiagnostics(
                 exchange=ex,
                 n_trades=n,
                 transport_latency_p50_ms=median_ms,
                 clock_offset_ms=applied,
+                flags=tuple(flags),
             )
         )
     diags.sort(key=lambda d: d.exchange)

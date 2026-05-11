@@ -363,7 +363,12 @@ analyzer:
 
 report:
   # Round-trip taker fee assumption used when computing the edge_bps proxy.
-  taker_bps: 10.0
+  # 6.0 bps ≈ 2 × 3 bps which is roughly the post-VIP-rebate taker on a
+  # tier-1 spot venue (binance, okx, bybit, kucoin). The old default of
+  # 10 bps was pessimistic and made every pair look unprofitable. Set
+  # higher (8-10 bps) if you trade non-VIP, lower (3-4 bps) on a maker
+  # rebate program.
+  taker_bps: 6.0
   # Round-trip half-spread paid on entry+exit, in basis points. The default
   # of 4.0 is deliberately optimistic for tier-1 venues and pessimistic for
   # microcaps — tune it to your actual venue mix. Used in `net_edge_bps`

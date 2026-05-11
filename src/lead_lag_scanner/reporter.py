@@ -39,9 +39,14 @@ clock. The analyzer subtracts the *cross-exchange median* of these
 values from each timestamp, so `clock_offset_applied` is the residual
 skew that was applied to align this exchange to the consensus timeline
 (positive = pushed forward in time, negative = pulled earlier).
+`flags` lists data-quality concerns: `clock_skew_outlier` means the
+exchange was excluded from the trusted-core median (its tape semantics
+disagree with the cohort by more than a few seconds);
+`slow_tape` means trades arrive >10 s after they nominally happened,
+capping any sub-second lag claim against this exchange.
 
-| Exchange | Trades | Transport latency p50 (ms) | Clock offset applied (ms) |
-|----------|-------:|---------------------------:|--------------------------:|
+| Exchange | Trades | Transport latency p50 (ms) | Clock offset applied (ms) | Flags |
+|----------|-------:|---------------------------:|--------------------------:|-------|
 """
 
 
@@ -142,11 +147,13 @@ def _format_row(result: LeadLagResult, config: ReportConfig) -> str:
 
 
 def _format_diagnostic_row(d: ExchangeDiagnostics) -> str:
+    flags = ",".join(d.flags) if d.flags else "—"
     return (
         f"| {d.exchange} "
         f"| {d.n_trades} "
         f"| {d.transport_latency_p50_ms:+.1f} "
-        f"| {d.clock_offset_ms:+.1f} |"
+        f"| {d.clock_offset_ms:+.1f} "
+        f"| {flags} |"
     )
 
 

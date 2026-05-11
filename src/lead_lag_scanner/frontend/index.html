@@ -142,6 +142,15 @@
       padding: 60px 24px; text-align: center; color: var(--muted);
     }
     .empty h3 { color: var(--text); margin: 0 0 8px 0; }
+    .banner {
+      margin-bottom: 12px; padding: 10px 14px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; font-size: 13px; line-height: 1.45;
+    }
+    .banner.warn { border-color: #5a4f1f; background: #2a2410; color: #f0c674; }
+    .banner.ok   { border-color: #1c4a2c; background: #112318; color: var(--green); }
+    .banner b { color: var(--text); }
+    .banner code { background: var(--pill); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
     footer {
       padding: 14px 24px; color: var(--muted);
       border-top: 1px solid var(--border); font-size: 12px;
@@ -190,15 +199,20 @@
     .help-text { color: var(--muted); font-size: 12px; line-height: 1.5; }
 
     .stat-grid {
-      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px;
+      display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 12px;
     }
-    @media (max-width: 700px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 900px) { .stat-grid { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 600px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
     .stat {
       background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
       padding: 8px 12px;
     }
     .stat .v { font-size: 20px; font-weight: 600; line-height: 1.2; }
     .stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .stat.hl { border-color: #1c4a2c; background: #112318; }
+    .stat.hl .v { color: var(--green); }
+    .stat.hl.zero { border-color: #5a4f1f; background: #2a2410; }
+    .stat.hl.zero .v { color: var(--yellow); }
   </style>
 </head>
 <body>
@@ -209,6 +223,9 @@
     <span>обновлено: <b id="updatedAt">—</b></span>
     <span>трейдов: <b id="nTrades">0</b></span>
     <span>пар: <b id="nPairs">0</b></span>
+    <span title="Чистый эдж > 0, направленный лидер, N ≥ 300, без флагов">
+      торгуемых: <b id="nTradeable">0</b>
+    </span>
     <label class="row" title="Авто-обновление каждые 30с">
       <input type="checkbox" id="autoRefresh" checked>
       <span>авто</span>
@@ -239,23 +256,42 @@
 
       <div style="margin-bottom: 8px;">
         <div class="small" style="margin-bottom: 4px;">
-          Минимум |корреляции|: <b id="minCorrLabel">0.30</b>
+          Минимум |корреляции|: <b id="minCorrLabel">0.50</b>
         </div>
         <div class="row-input">
-          <input type="range" id="minCorr" min="0" max="1" step="0.05" value="0.30">
+          <input type="range" id="minCorr" min="0" max="1" step="0.05" value="0.50">
         </div>
       </div>
 
       <div style="margin-bottom: 8px;">
         <div class="small" style="margin-bottom: 4px;">Минимум наблюдений (бар, сек)</div>
         <div class="row-input">
-          <input type="number" id="minObs" min="0" max="100000" step="10" value="60">
+          <input type="number" id="minObs" min="0" max="100000" step="10" value="300">
         </div>
       </div>
 
       <label class="row" style="margin-top: 6px;">
-        <span>Только направленные (без CI вокруг 0)</span>
-        <input type="checkbox" id="onlyDirectional">
+        <span title="CI лага не пересекает 0 — лидер реально опережает">
+          Только направленные пары
+        </span>
+        <input type="checkbox" id="onlyDirectional" checked>
+      </label>
+
+      <label class="row" title="Чистый эдж = эдж − 2×комиссия − спред − slippage. < 0 значит торговать на этой паре дороже, чем зарабатывать.">
+        <span>Скрыть убыточные (чистый эдж ≤ 0)</span>
+        <input type="checkbox" id="hideLossMaking" checked>
+      </label>
+
+      <label class="row" title="Стакан медленнее 1 трейда в 5 секунд — «лидерство» скорее всего иллюзия стейл-цены. Поднимай, если хочешь только реально жидкие пары.">
+        <span>Только активные стаканы (<b id="minActiveRateLabel">0.30</b>)</span>
+      </label>
+      <div class="row-input" style="margin-top: 0;">
+        <input type="range" id="minActiveRate" min="0" max="1" step="0.05" value="0.30">
+      </div>
+
+      <label class="row" style="margin-top: 6px;" title="Оставить только пары, где хотя бы одна сторона — крупная биржа (binance/okx/bybit/kucoin/kraken/coinbase/gate/mexc/bitget/htx/bitfinex/binanceus).">
+        <span>Только tier-1 биржи</span>
+        <input type="checkbox" id="tier1Only">
       </label>
 
       <div style="margin-top: 10px;">
@@ -331,7 +367,13 @@
         <div class="l">пар выше порогов</div>
         <div class="v" id="statPairs">—</div>
       </div>
+      <div class="stat hl" id="statTradeableBox" title="Чистый эдж > 0, направленный лидер, N ≥ 300, без флагов">
+        <div class="l">торгуемых сейчас</div>
+        <div class="v" id="statTradeable">—</div>
+      </div>
     </div>
+
+    <div id="banner" class="banner" style="display:none;"></div>
 
     <div class="table-wrap">
       <table>
@@ -470,17 +512,28 @@ const state = {
   sortBy: "tradeability",
   sortColumn: null,   // optional client-side override
   sortAsc: false,
-  minCorr: 0.30,
-  minObs: 60,
-  onlyDirectional: false,
+  // Tighter defaults — see banner copy for rationale. The earlier
+  // (0.30 / 60 / off) trio happily promoted slow-tape mirages to the
+  // top of the table; with these, only pairs that actually clear fees
+  // *and* have a directional CI show up by default.
+  minCorr: 0.50,
+  minObs: 300,
+  onlyDirectional: true,
+  hideLossMaking: true,
+  minActiveRate: 0.30,
+  tier1Only: false,
   hideFlags: new Set(["boundary_lag", "wide_ci"]),
   limit: 200,
   refreshSeconds: 30,
   taker: 10,
+  spreadBps: 4,
+  slippageBps: 2,
+  tier1Exchanges: [],
   runtimeTickers: [],
   exConfigured: 0,
   exWithData: 0,
   symConfigured: 0,
+  nTradeable: 0,
   pairs: [],
   diagnostics: [],
   lastUpdate: "—",
@@ -509,8 +562,12 @@ async function loadState() {
     state.exConfigured = s.exchanges_configured.length;
     state.exWithData = s.exchanges_with_trades.length;
     state.symConfigured = s.symbols_configured.length;
+    state.nTradeable = s.n_tradeable ?? 0;
     state.refreshSeconds = s.refresh_seconds;
     state.taker = s.taker_bps;
+    state.spreadBps = s.spread_bps ?? 4;
+    state.slippageBps = s.slippage_bps ?? 2;
+    state.tier1Exchanges = (s.tier1_exchanges || []).slice();
     state.runtimeTickers = s.runtime_symbols.slice();
     state.lastUpdate = s.computed_at;
     state.lastError = s.last_error;
@@ -525,7 +582,12 @@ async function loadState() {
     document.getElementById("statPairs").textContent = s.n_pairs;
     document.getElementById("nTrades").textContent = s.n_trades.toLocaleString("ru");
     document.getElementById("nPairs").textContent = s.n_pairs;
+    document.getElementById("nTradeable").textContent = state.nTradeable;
+    document.getElementById("statTradeable").textContent = state.nTradeable;
+    const trBox = document.getElementById("statTradeableBox");
+    trBox.classList.toggle("zero", state.nTradeable === 0);
     document.getElementById("updatedAt").textContent = s.computed_at;
+    renderBanner();
     renderExchanges();
     renderSymbols();
     renderRuntimeTickers();
@@ -539,6 +601,32 @@ async function loadState() {
   } catch (e) {
     showToast("Не получилось загрузить /api/state: " + e.message, "error");
   }
+}
+
+// Fee-transparency / empty-state banner. Computed from `state` so it
+// reacts to whatever the user is currently filtering on. We always show
+// the round-trip cost budget so the "0 tradeable" verdict can't surprise
+// the user.
+function renderBanner() {
+  const el = document.getElementById("banner");
+  if (!el) return;
+  const taker = +state.taker || 0;
+  const spread = +state.spreadBps || 0;
+  const slip = +state.slippageBps || 0;
+  const roundTrip = 2 * taker + spread + slip;
+  const costMsg = `чтобы пара окупилась, грязный эдж должен быть > <b>${roundTrip.toFixed(1)} bps</b> (= 2 × ${taker.toFixed(1)} тейкер + ${spread.toFixed(1)} спред + ${slip.toFixed(1)} проскальз.).`;
+  if (state.nTradeable === 0) {
+    el.className = "banner warn";
+    el.innerHTML =
+      `<b>Сейчас торгуемых пар: 0.</b> ` + costMsg +
+      ` Понизить пороги в <code>config.report</code> или потерпеть пока накопится больше данных.`;
+    el.style.display = "block";
+    return;
+  }
+  el.className = "banner ok";
+  el.innerHTML =
+    `<b>Найдено ${state.nTradeable} реально торгуемых пар.</b> ` + costMsg;
+  el.style.display = "block";
 }
 
 async function loadPairs() {
@@ -557,6 +645,9 @@ async function loadPairs() {
   // to its own default of "boundary_lag,wide_ci" when the user unchecks them.
   params.set("hide_flags", Array.from(state.hideFlags).join(","));
   params.set("limit", state.limit);
+  if (state.hideLossMaking) params.set("min_net_edge_bps", "0.0001");
+  if (state.minActiveRate > 0) params.set("min_active_rate", state.minActiveRate);
+  if (state.tier1Only) params.set("tier1_only", "true");
   if (exSel) params.set("exchanges", exSel.join(","));
   if (symSel) params.set("symbols", symSel.join(","));
   try {
@@ -738,17 +829,23 @@ function renderPairs() {
 function renderDiagnostics() {
   const tbody = document.getElementById("diagBody");
   if (!state.diagnostics || state.diagnostics.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" class="dim" style="padding:14px;text-align:center;">диагностика появится после первого пересчёта</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="dim" style="padding:14px;text-align:center;">диагностика появится после первого пересчёта</td></tr>';
     return;
   }
-  tbody.innerHTML = state.diagnostics.map(d => `
+  tbody.innerHTML = state.diagnostics.map(d => {
+    const flags = (d.flags && d.flags.length)
+      ? d.flags.map(f => `<span class="flag-chip">${f}</span>`).join("")
+      : '<span class="dim">—</span>';
+    return `
     <tr>
       <td><b>${d.exchange}</b></td>
       <td class="right">${d.n_trades.toLocaleString("ru")}</td>
       <td class="right">${fmtSign1(d.transport_latency_p50_ms)}</td>
       <td class="right">${fmtSign1(d.clock_offset_ms)}</td>
+      <td>${flags}</td>
     </tr>
-  `).join("");
+    `;
+  }).join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +873,19 @@ document.getElementById("minObs").addEventListener("change", (e) => {
 });
 document.getElementById("onlyDirectional").addEventListener("change", (e) => {
   state.onlyDirectional = e.target.checked;
+  loadPairs();
+});
+document.getElementById("hideLossMaking").addEventListener("change", (e) => {
+  state.hideLossMaking = e.target.checked;
+  loadPairs();
+});
+document.getElementById("minActiveRate").addEventListener("input", (e) => {
+  state.minActiveRate = parseFloat(e.target.value);
+  document.getElementById("minActiveRateLabel").textContent = state.minActiveRate.toFixed(2);
+});
+document.getElementById("minActiveRate").addEventListener("change", () => loadPairs());
+document.getElementById("tier1Only").addEventListener("change", (e) => {
+  state.tier1Only = e.target.checked;
   loadPairs();
 });
 

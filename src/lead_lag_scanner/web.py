@@ -60,6 +60,27 @@ INDEX_HTML_PATH = FRONTEND_DIR / "index.html"
 # accidental whitespace / control characters from the UI.
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,15}(?:[-_][A-Z0-9]{1,5})?/[A-Z0-9]{2,8}$")
 
+# Tier-1 venues: top-volume, well-regulated, low-spread CEXs whose
+# last-trade price is rarely "stale". When ``tier1_only`` is set we keep
+# only pairs where *at least one* side belongs to this list, so the user
+# stops seeing toobit→deepcoin "leaders" that are just slow-tape mirages.
+_TIER1_EXCHANGES = frozenset(
+    {
+        "binance",
+        "binanceus",
+        "okx",
+        "bybit",
+        "kucoin",
+        "kraken",
+        "coinbase",
+        "gate",
+        "mexc",
+        "bitget",
+        "htx",
+        "bitfinex",
+    }
+)
+
 
 @dataclass(slots=True)
 class _Snapshot:
@@ -183,6 +204,7 @@ class DiagnosticOut(BaseModel):
     n_trades: int
     transport_latency_p50_ms: float
     clock_offset_ms: float
+    flags: list[str] = []
 
 
 class StateOut(BaseModel):
@@ -192,12 +214,16 @@ class StateOut(BaseModel):
     last_error: str | None
     n_trades: int
     n_pairs: int
+    n_tradeable: int  # pairs whose net edge covers fees AND lag is directional
     exchanges_configured: list[str]
     exchanges_with_trades: list[str]
     symbols_configured: list[str]
     symbols_with_trades: list[str]
     runtime_symbols: list[str]
     taker_bps: float
+    spread_bps: float
+    slippage_bps: float
+    tier1_exchanges: list[str]
 
 
 class PairsOut(BaseModel):
@@ -272,12 +298,21 @@ def _filter_pairs(
     min_n_obs: int,
     only_directional: bool,
     hide_flags: set[str] | None = None,
+    min_net_edge_bps: float | None = None,
+    min_active_rate: float = 0.0,
+    tier1_only: bool = False,
 ) -> list[PairOut]:
-    """Apply correlation / observation / exchange / symbol / flag filters.
+    """Apply the full filter stack used by the dashboard.
 
     ``hide_flags`` removes any pair whose ``flags`` set intersects the
-    provided set. The web UI uses this to hide ``boundary_lag`` and
-    ``wide_ci`` by default.
+    provided set. ``min_net_edge_bps`` drops pairs whose post-cost edge
+    would not cover the configured fee + spread + slippage budget — i.e.
+    pairs that are mathematically unprofitable to trade. ``min_active_rate``
+    drops pairs where *either* side trades thinner than this fraction of
+    bars (kills the "slow-tape leader" mirage: a venue updating once per
+    20s looks like it leads a 5-trades/s venue by 3s, but it's just stale
+    last-trade data). ``tier1_only`` keeps only pairs where at least one
+    side is a tier-1 venue.
     """
 
     out: list[PairOut] = []
@@ -296,8 +331,35 @@ def _filter_pairs(
             continue
         if hide_flags and any(f in hide_flags for f in p.flags):
             continue
+        if min_net_edge_bps is not None and p.net_edge_bps < min_net_edge_bps:
+            continue
+        if min_active_rate > 0.0 and min(p.active_rate_a, p.active_rate_b) < min_active_rate:
+            continue
+        if tier1_only and (
+            p.exchange_a not in _TIER1_EXCHANGES and p.exchange_b not in _TIER1_EXCHANGES
+        ):
+            continue
         out.append(p)
     return out
+
+
+def _count_tradeable(pairs: list[PairOut]) -> int:
+    """Honest count of *actually-tradeable* pairs in the current snapshot.
+
+    A pair is tradeable iff the net-of-cost edge is strictly positive,
+    a leader is identified (the lag CI excludes zero), and the sample is
+    large enough that the correlation is not a fluke. These thresholds
+    mirror the defaults the dashboard suggests in the UI; if the user
+    loosens the filters in the panel the *displayed* row count will be
+    larger but ``n_tradeable`` will not — it is intentionally pessimistic
+    so a "0" in the header card is a real "0".
+    """
+
+    return sum(
+        1
+        for p in pairs
+        if p.net_edge_bps > 0.0 and p.leader != "none" and p.n_obs >= 300 and not p.flags
+    )
 
 
 _SORT_KEYS = {
@@ -362,6 +424,8 @@ def _build_state_response(state: WebState) -> StateOut:
         snap = state.snapshot
     merged = merge_runtime_symbols(state.base_config)
     runtime = list(load_runtime_symbols(state.base_config.storage.data_dir))
+    report_cfg = state.base_config.report
+    pair_views = [_result_to_pair(r, report_cfg) for r in snap.results]
     return StateOut(
         computed_at=snap.computed_at.isoformat(timespec="seconds"),
         refresh_seconds=state.refresh_seconds,
@@ -369,12 +433,16 @@ def _build_state_response(state: WebState) -> StateOut:
         last_error=snap.last_error,
         n_trades=snap.n_trades,
         n_pairs=len(snap.results),
+        n_tradeable=_count_tradeable(pair_views),
         exchanges_configured=list(merged.exchanges),
         exchanges_with_trades=list(snap.exchanges_with_trades),
         symbols_configured=list(merged.symbols),
         symbols_with_trades=list(snap.symbols_with_trades),
         runtime_symbols=runtime,
         taker_bps=merged.report.taker_bps,
+        spread_bps=merged.report.spread_bps,
+        slippage_bps=merged.report.slippage_bps,
+        tier1_exchanges=sorted(_TIER1_EXCHANGES),
     )
 
 
@@ -389,6 +457,9 @@ def _build_pairs_response(
     only_directional: bool,
     hide_flags: str | None,
     limit: int,
+    min_net_edge_bps: float | None = None,
+    min_active_rate: float = 0.0,
+    tier1_only: bool = False,
 ) -> PairsOut:
     with state.lock:
         snap = state.snapshot
@@ -402,6 +473,9 @@ def _build_pairs_response(
         min_n_obs=max(0, int(min_obs)),
         only_directional=bool(only_directional),
         hide_flags=_split_csv(hide_flags),
+        min_net_edge_bps=(None if min_net_edge_bps is None else float(min_net_edge_bps)),
+        min_active_rate=max(0.0, min(1.0, float(min_active_rate))),
+        tier1_only=bool(tier1_only),
     )
     ranked = _sort_pairs(filtered, sort_by)[: max(1, int(limit))]
     return PairsOut(
@@ -516,6 +590,9 @@ def create_app(config: Config, *, refresh_seconds: float | None = None) -> FastA
         only_directional: bool = False,
         hide_flags: str | None = "boundary_lag,wide_ci",
         limit: int = 200,
+        min_net_edge_bps: float | None = None,
+        min_active_rate: float = 0.0,
+        tier1_only: bool = False,
     ) -> PairsOut:
         return _build_pairs_response(
             state,
@@ -527,6 +604,9 @@ def create_app(config: Config, *, refresh_seconds: float | None = None) -> FastA
             only_directional=only_directional,
             hide_flags=hide_flags,
             limit=limit,
+            min_net_edge_bps=min_net_edge_bps,
+            min_active_rate=min_active_rate,
+            tier1_only=tier1_only,
         )
 
     @app.get("/api/symbols", response_model=SymbolsOut)
