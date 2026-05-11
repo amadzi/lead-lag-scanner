@@ -43,6 +43,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -301,6 +302,89 @@ def _quarantine_corrupt_shard_from_error(data_dir: Path, exc: BaseException) -> 
     return _quarantine_shard(candidate)
 
 
+# How long to skip the DuckDB fast path after a generic error before we
+# probe again. DuckDB is much faster than the per-shard pyarrow fallback
+# but if even one shard makes its thrift parser bail (e.g. a
+# ``TProtocolException: Invalid data`` on a footer written by a newer
+# pyarrow), every subsequent call will hit the same shard and waste time
+# building a connection. 5 minutes is long enough to stop spamming the
+# log on a 5-second dashboard refresh and short enough that the user
+# sees DuckDB come back once they delete or rotate the bad shard.
+_DUCKDB_FAILURE_BACKOFF_SECONDS = 300.0
+# Mutable container so we can update it from helpers without ``global``
+# (ruff PLW0603). Keys: ``until`` (float monotonic ts), ``reason`` (str).
+_duckdb_skip_state: dict[str, object] = {"until": 0.0, "reason": ""}
+
+
+def _duckdb_should_skip(now: float | None = None) -> bool:
+    until = float(_duckdb_skip_state["until"])  # type: ignore[arg-type]
+    if until <= 0.0:
+        return False
+    return (now if now is not None else time.monotonic()) < until
+
+
+def _disable_duckdb_until_retry(reason: str, now: float | None = None) -> None:
+    """Skip the DuckDB fast path for ``_DUCKDB_FAILURE_BACKOFF_SECONDS``.
+
+    Logs at INFO the first time a given reason fires (or after the
+    previous skip expired) so a single bad shard doesn't fill the log
+    with one warning per dashboard refresh.
+    """
+
+    now = now if now is not None else time.monotonic()
+    prev_until = float(_duckdb_skip_state["until"])  # type: ignore[arg-type]
+    prev_reason = str(_duckdb_skip_state["reason"])
+    new_reason = reason != prev_reason
+    expired = now >= prev_until
+    _duckdb_skip_state["until"] = now + _DUCKDB_FAILURE_BACKOFF_SECONDS
+    _duckdb_skip_state["reason"] = reason
+    if new_reason or expired:
+        log.info(
+            "load_trades: using pyarrow fallback for the next %.0fs (%s)",
+            _DUCKDB_FAILURE_BACKOFF_SECONDS,
+            reason,
+        )
+
+
+def _clear_duckdb_skip() -> None:
+    if float(_duckdb_skip_state["until"]) > 0.0:  # type: ignore[arg-type]
+        log.info("load_trades: DuckDB fast path recovered")
+    _duckdb_skip_state["until"] = 0.0
+    _duckdb_skip_state["reason"] = ""
+
+
+def _identify_offending_shards(data_dir: Path) -> list[Path]:
+    """Find parquet shards that DuckDB cannot read.
+
+    Used after a generic ``duckdb.Error`` to narrow down which file is
+    responsible. We open every ``*.parquet`` under ``<data_dir>/trades/``
+    with DuckDB's ``read_parquet`` and collect the ones whose query
+    raises any subclass of ``duckdb.Error`` — caller decides whether to
+    quarantine them (if pyarrow also can't read them) or just note them
+    in a one-time log line (if pyarrow handles them fine).
+    """
+
+    trades_dir = data_dir / "trades"
+    if not trades_dir.exists():
+        return []
+    offenders: list[Path] = []
+    for shard in sorted(trades_dir.rglob("*.parquet")):
+        try:
+            with duckdb.connect() as con:
+                con.execute(f"SELECT 1 FROM read_parquet('{shard}') LIMIT 0").fetchone()
+        except duckdb.Error:
+            offenders.append(shard)
+    return offenders
+
+
+def _pyarrow_can_read(shard: Path) -> bool:
+    try:
+        pq.read_table(shard)
+    except (OSError, pa.ArrowException):
+        return False
+    return True
+
+
 def load_trades(
     data_dir: Path,
     *,
@@ -329,14 +413,19 @@ def load_trades(
        iterations to handle multiple bad shards.
     3. **Per-shard pyarrow fallback** — for any other DuckDB error
        (``NotImplementedException`` from a newer pandas/duckdb pair that
-       can't map a column type, ``ConversionException`` from a logical
-       type that doesn't fit numpy, etc.) we fall back to reading each
-       shard individually with ``pyarrow.parquet.read_table``,
-       quarantining shards that pyarrow itself can't read, promoting the
-       rest to :data:`TRADE_SCHEMA`, concatenating, and converting via
-       ``pa.Table.to_pandas`` (a more permissive code path than
-       DuckDB's numpy converter).
+       can't map a column type, ``TProtocolException`` raised by the
+       thrift parser on a footer DuckDB doesn't understand, etc.) we
+       probe each shard with DuckDB individually to identify the
+       offender(s). Shards pyarrow also can't read are quarantined
+       (genuine corruption). Shards pyarrow *can* read but DuckDB can't
+       are left in place; we just skip the DuckDB fast path for the next
+       :data:`_DUCKDB_FAILURE_BACKOFF_SECONDS` and read everything via
+       pyarrow, so the log isn't spammed on a 5-second dashboard
+       refresh.
     """
+
+    if _duckdb_should_skip():
+        return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
 
     glob = parquet_glob(data_dir)
     query, params = _build_load_query(glob, exchange=exchange, symbol=symbol)
@@ -345,26 +434,65 @@ def load_trades(
     for _attempt in range(_MAX_LOAD_ATTEMPTS):
         try:
             with duckdb.connect() as con:
-                return _post_process_frame(con.execute(query, params).df())
+                df = _post_process_frame(con.execute(query, params).df())
+            _clear_duckdb_skip()
+            return df
         except (duckdb.IOException, duckdb.InvalidInputException) as exc:
             if _quarantine_corrupt_shard_from_error(data_dir, exc):
                 continue
-            log.warning(
-                "load_trades: corrupt shard not identifiable from error; falling back to pyarrow: %s",
+            return _handle_generic_duckdb_failure(
+                data_dir,
                 exc,
+                exchange=exchange,
+                symbol=symbol,
             )
-            return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
         except duckdb.Error as exc:
-            log.warning(
-                "load_trades: duckdb path failed (%s); falling back to pyarrow: %s",
-                type(exc).__name__,
+            return _handle_generic_duckdb_failure(
+                data_dir,
                 exc,
+                exchange=exchange,
+                symbol=symbol,
             )
-            return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
     log.warning(
         "load_trades: gave up after %d quarantine retries; falling back to pyarrow",
         _MAX_LOAD_ATTEMPTS,
     )
+    return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
+
+
+def _handle_generic_duckdb_failure(
+    data_dir: Path,
+    exc: BaseException,
+    *,
+    exchange: str | None,
+    symbol: str | None,
+) -> pd.DataFrame:
+    """Identify the offender(s), quarantine the genuinely corrupt ones, fall back."""
+
+    offenders = _identify_offending_shards(data_dir)
+    quarantined: list[Path] = []
+    irrecoverable: list[Path] = []
+    for shard in offenders:
+        if _pyarrow_can_read(shard):
+            irrecoverable.append(shard)
+        elif _quarantine_shard(shard):
+            quarantined.append(shard)
+    if quarantined:
+        log.info(
+            "load_trades: quarantined %d corrupt shard(s) DuckDB and pyarrow could not read: %s",
+            len(quarantined),
+            ", ".join(str(p) for p in quarantined),
+        )
+    if irrecoverable:
+        names = ", ".join(p.name for p in irrecoverable[:3])
+        suffix = "" if len(irrecoverable) <= 3 else f" (+{len(irrecoverable) - 3} more)"
+        reason = (
+            f"DuckDB cannot parse {len(irrecoverable)} shard(s) "
+            f"pyarrow handles fine: {names}{suffix}"
+        )
+    else:
+        reason = f"DuckDB error ({type(exc).__name__}: {exc})"
+    _disable_duckdb_until_retry(reason)
     return _load_trades_via_pyarrow(data_dir, exchange=exchange, symbol=symbol)
 
 

@@ -8,10 +8,17 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lead_lag_scanner import storage as _storage_module
 from lead_lag_scanner.storage import (
     _CORRUPT_PATH_RE,
+    _DUCKDB_FAILURE_BACKOFF_SECONDS,
     Trade,
     TradeWriter,
+    _clear_duckdb_skip,
+    _disable_duckdb_until_retry,
+    _duckdb_should_skip,
+    _handle_generic_duckdb_failure,
+    _identify_offending_shards,
     _load_trades_via_pyarrow,
     _promote_to_trade_schema,
     _quarantine_corrupt_shard_from_error,
@@ -255,6 +262,96 @@ def test_load_trades_via_pyarrow_filters_by_exchange(tmp_path: Path) -> None:
     df = _load_trades_via_pyarrow(tmp_path, exchange="okx")
     assert len(df) == 1
     assert df["exchange"].iloc[0] == "okx"
+
+
+# ---------------------------------------------------------------------------
+# Generic-duckdb-failure recovery path: when DuckDB's read_parquet raises
+# something other than IOException/InvalidInputException (e.g. a
+# TProtocolException on a footer it can't parse but pyarrow can), we should
+# (a) identify the offending shard, (b) quarantine it if pyarrow also can't
+# read it, (c) cache the "use pyarrow" decision for a few minutes so the
+# log isn't spammed on every dashboard refresh.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_generic_failure_quarantines_when_pyarrow_also_fails(
+    tmp_path: Path,
+) -> None:
+    """A shard neither DuckDB nor pyarrow can read is moved to *.parquet.corrupt."""
+
+    writer = TradeWriter(data_dir=tmp_path, flush_every=10)
+    writer.append(_make_trade(1_700_000_000_000))
+    writer.close()
+
+    bad = tmp_path / "trades" / "kraken" / "2023-11-14.parquet"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_bytes(b"not parquet at all")
+
+    _clear_duckdb_skip()
+    fake_exc = duckdb.Error("TProtocolException: Invalid data")
+    df = _handle_generic_duckdb_failure(tmp_path, fake_exc, exchange=None, symbol=None)
+
+    assert not bad.exists()
+    assert (tmp_path / "trades" / "kraken" / "2023-11-14.parquet.corrupt").exists()
+    # Good shard still loads via the pyarrow fallback.
+    assert len(df) == 1
+    _clear_duckdb_skip()
+
+
+def test_handle_generic_failure_caches_pyarrow_decision_when_shard_is_duckdb_only_bad(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """A shard pyarrow can read but DuckDB cannot triggers a cached skip."""
+
+    writer = TradeWriter(data_dir=tmp_path, flush_every=10)
+    writer.append(_make_trade(1_700_000_000_000))
+    writer.close()
+
+    only_duckdb_fake_path = tmp_path / "trades" / "binance" / "2023-11-14-99999999.parquet"
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        _storage_module,
+        "_identify_offending_shards",
+        lambda _data_dir: [only_duckdb_fake_path],
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        _storage_module,
+        "_pyarrow_can_read",
+        lambda _shard: True,
+    )
+
+    _clear_duckdb_skip()
+    fake_exc = duckdb.Error("TProtocolException: Invalid data")
+    _handle_generic_duckdb_failure(tmp_path, fake_exc, exchange=None, symbol=None)
+
+    # Skip cached so a re-entry within the backoff window short-circuits.
+    assert _duckdb_should_skip() is True
+    assert _duckdb_should_skip(now=1.0 + _DUCKDB_FAILURE_BACKOFF_SECONDS * 1e6) is False
+    _clear_duckdb_skip()
+
+
+def test_identify_offending_shards_returns_only_broken(tmp_path: Path) -> None:
+    """The probe touches every shard and only flags the truly broken ones."""
+
+    writer = TradeWriter(data_dir=tmp_path, flush_every=10)
+    writer.append(_make_trade(1_700_000_000_000))
+    writer.append(_make_trade(1_700_000_001_000, exchange="okx"))
+    writer.close()
+    bad = tmp_path / "trades" / "kraken" / "2023-11-14.parquet"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_bytes(b"not a parquet file")
+
+    offenders = _identify_offending_shards(tmp_path)
+    assert offenders == [bad]
+
+
+def test_disable_then_clear_duckdb_skip_round_trip() -> None:
+    _clear_duckdb_skip()
+    assert _duckdb_should_skip() is False
+    _disable_duckdb_until_retry("test reason")
+    assert _duckdb_should_skip() is True
+    _clear_duckdb_skip()
+    assert _duckdb_should_skip() is False
 
 
 def test_load_trades_via_pyarrow_handles_legacy_schema(tmp_path: Path) -> None:
