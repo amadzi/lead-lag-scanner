@@ -1,0 +1,98 @@
+[project]
+name = "lead-lag-scanner"
+version = "0.1.0"
+description = "Discover lead/follower exchange pairs in crypto spot markets via cross-correlation of tick-level trade data."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "lead-lag-scanner contributors" }]
+dependencies = [
+    "ccxt>=4.4.0",
+    "click>=8.1.7",
+    "duckdb>=1.1.0",
+    "fastapi>=0.115.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "pyarrow>=17.0.0",
+    "pydantic>=2.8.0",
+    "pyyaml>=6.0.2",
+    "rich>=13.7.0",
+    "scipy>=1.13.0",
+    "structlog>=24.4.0",
+    "tqdm>=4.66.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.9.0", "seaborn>=0.13.0"]
+ws = [
+    "ccxt[pro]>=4.4.0",
+    # MEXC's ccxt.pro client decodes WS frames with protobuf. Without this
+    # package every WS message raises NotSupported, hits the 5-failure
+    # threshold, and permanently disables the (exchange, symbol) pair for
+    # the rest of the run. Version pinned to what ccxt.pro 4.4.x expects.
+    "protobuf>=5.29.5",
+]
+
+[project.scripts]
+lead-lag-scanner = "lead_lag_scanner.cli:cli"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lead_lag_scanner"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/lead_lag_scanner/frontend" = "lead_lag_scanner/frontend"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+    "TID", # tidy imports
+    "PL",  # pylint
+    "PT",  # pytest
+]
+ignore = [
+    "PLR0913", # too many arguments
+    "PLR2004", # magic value comparison
+    "E501",    # line too long handled by formatter
+    "RUF001",  # ambiguous unicode characters (we use math notation: x, sigma, minus)
+    "RUF002",  # same in docstrings
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR2004", "S101"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["src", "tests"]
+typeCheckingMode = "basic"
+reportMissingImports = "error"
+reportMissingTypeStubs = "none"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.6.0",
+    "pyright>=1.1.380",
+]
